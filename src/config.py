@@ -60,6 +60,7 @@ def pe(name: str, fallback: str = "") -> str:
 SOURCES = {
     "zieng2": {
         "name": "zieng2 — GitHub",
+        "connect_name": "zieng2",
         "description": "VLESS whitelist feed",
         "url_strategy": "first_available",
         "urls": [
@@ -68,6 +69,7 @@ SOURCES = {
     },
     "igareck": {
         "name": "igareck — white GitHub",
+        "connect_name": "igareck",
         "description": "VLESS из белых CIDR",
         "url_strategy": "first_available",
         "urls": [
@@ -77,6 +79,7 @@ SOURCES = {
     },
     "cid_vpn": {
         "name": "CID VPN — GitHub",
+        "connect_name": "CID VPN",
         "description": "Основная VLESS-подписка CID VPN",
         "url_strategy": "first_available",
         "urls": [
@@ -85,6 +88,7 @@ SOURCES = {
     },
     "byewhitelists2": {
         "name": "ByeWhiteLists 2.0 — GitHub",
+        "connect_name": "ByeWhiteLists 2.0",
         "description": "GoodbyeWL / ByeWhiteLists 2.0",
         "url_strategy": "first_available",
         "urls": [
@@ -93,6 +97,7 @@ SOURCES = {
     },
     "ghost_vpn": {
         "name": "Ghost VPN — white GitHub",
+        "connect_name": "Ghost VPN",
         "description": "White-list VLESS feeds",
         "url_strategy": "all",
         "urls": [
@@ -102,6 +107,7 @@ SOURCES = {
     },
     "igareck_black": {
         "name": "igareck — black GitHub",
+        "connect_name": "igareck №2",
         "description": "VLESS для обычных блокировок",
         "url_strategy": "all",
         "urls": [
@@ -111,6 +117,7 @@ SOURCES = {
     },
     "ghost_vpn_black": {
         "name": "Ghost VPN — black GitHub",
+        "connect_name": "Ghost VPN №2",
         "description": "Black-list VLESS feed",
         "url_strategy": "first_available",
         "urls": [
@@ -119,6 +126,7 @@ SOURCES = {
     },
     "aetris_vpn": {
         "name": "AetrisVPN — black GitHub",
+        "connect_name": "AetrisVPN",
         "description": "Автообновляемая VLESS-подписка AetrisVPN",
         "url_strategy": "first_available",
         "urls": [
@@ -127,6 +135,7 @@ SOURCES = {
     },
     "github_discovery": {
         "name": "Строгий GitHub-поиск VLESS",
+        "connect_name": "GitHub discovery",
         "description": "Поиск VLESS/VPN/config/list/blacklist feed-ов",
         "discovery": True,
         "search_queries": [
@@ -179,38 +188,28 @@ AGGREGATED_SUBS = {
 AGGREGATED_SUBS["COMBINED"] = AGGREGATED_SUBS["FULL"]
 
 
-WELCOME_TEXT = """<b>Free VPN • Crimson</b> — рабочие автообновляемые конфиги для вашего интернета. По вопросам «Помощь»
+WELCOME_TEXT = """<b>Free VPN • Crimson</b> — рабочие автообновляемые VLESS-подписки для вашего интернета.
 
-<b>Два режима:</b>
-
-<b>Черные</b> — весь трафик через VPN
-
-<b>Белые</b> — для жестких ТСПУ, когда работает только VK / Яндекс
+Нажми <b>«Подключить»</b>, выбери источник и добавь его raw-ссылку в VPN-клиент как подписку.
 
 <i>Построй свой суверенитет в сети с помощью Crimson.</i>"""
 
-FILE_USAGE_TEXT = """<b>Как использовать файл:</b>
-1. Скачай полученный <code>.txt</code>.
-2. Если VPN-клиент поддерживает импорт из файла — выбери этот файл.
-3. Иначе открой <code>.txt</code>, скопируй нужную строку <code>vless://…</code> и выбери в клиенте «Импорт из буфера обмена».
-4. Проверь несколько конфигураций и оставь ту, которая подключается стабильнее."""
-
-HELP_TEXT = f"""<b>Free VPN • Crimson — помощь</b>
+HELP_TEXT = """<b>Free VPN • Crimson — помощь</b>
 
 <b>«Профиль»</b> — твой ID
-<b>«Белые списки»</b> — для ТСПУ
-<b>«Черные списки»</b> — весь трафик через VPN
-<b>«Полный список»</b> — все вместе
+<b>«Подключить»</b> — все доступные подписки и их raw-ссылки без разделения на белые и чёрные списки.
 
-Бот отправляет только готовые <code>.txt</code>-файлы, без ссылок на подписки.
+<b>Как подключиться:</b>
+1. Открой «Подключить».
+2. Скопируй raw-ссылку выбранного источника.
+3. В Happ, Hiddify, Streisand, v2rayNG или NekoRay выбери добавление подписки по ссылке.
+4. Вставь ссылку и обнови подписку.
 
-{FILE_USAGE_TEXT}
-
-Подходящие клиенты: Happ, Hiddify, Streisand, v2rayNG и NekoRay.
+Количество VLESS рядом с каждым источником обновляется автоматически.
 Вопросы — @unnervin"""
 
 SOURCES_TEXT = """<b>Источники VLESS</b>
 
-Используются только GitHub feed-ы: zieng2, igareck, CID VPN, ByeWhiteLists 2.0, Ghost VPN, AetrisVPN и строгий GitHub-поиск.
+Во вкладке «Подключить» отображаются рабочие GitHub raw-ссылки zieng2, igareck, CID VPN, ByeWhiteLists 2.0, Ghost VPN, AetrisVPN и строгого GitHub-поиска.
 
-Поиск учитывает слова VLESS, VPN, config, list и blacklist. Широкие collection/index-источники отключены. Из файлов принимаются только корректные <b>VLESS</b>; дубликаты удаляются."""
+Поиск учитывает слова VLESS, VPN, config, list и blacklist. Широкие collection/index-источники отключены. Из подписок принимаются только корректные <b>VLESS</b>; дубликаты удаляются."""

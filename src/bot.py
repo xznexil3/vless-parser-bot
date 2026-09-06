@@ -1,5 +1,6 @@
 import os
 import asyncio
+import html
 import logging
 import json
 from datetime import datetime, timezone, timedelta
@@ -119,20 +120,8 @@ def main_keyboard(user_id: int = None):
         ],
         [
             InlineKeyboardButton(
-                "«Белые списки»",
-                callback_data="white",
-                style=KeyboardButtonStyle.SUCCESS,
-            ),
-            InlineKeyboardButton(
-                "«Черные списки»",
-                callback_data="black",
-                style=KeyboardButtonStyle.SUCCESS,
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "«Полный список»",
-                callback_data="full",
+                "«Подключить»",
+                callback_data="connect",
                 style=KeyboardButtonStyle.SUCCESS,
             )
         ],
@@ -229,100 +218,88 @@ def back_keyboard(callback_data: str = "home") -> InlineKeyboardMarkup:
     )
 
 
-def chunks_keyboard(
-    base_filename: str,
-    chunk_list,
-    back_data: str = "home",
-    back_label: str = "«Назад»",
-):
-    rows = []
-    for _, (cfname, _, cnt) in enumerate(chunk_list, 1):
-        short = cfname.replace(".txt", "")
-        label = f"«{short} · {cnt}»"
-        button = InlineKeyboardButton(
-            label,
-            callback_data=f"chunk:{cfname}",
-            style=KeyboardButtonStyle.PRIMARY,
+def source_subscription_urls(source_key: str, data: dict) -> list[str]:
+    """Return the actual GitHub raw feeds used for one source refresh."""
+    source = config.SOURCES.get(source_key, {})
+    urls = list(data.get("used_urls") or [])
+    if not urls and not source.get("discovery"):
+        configured = list(source.get("urls") or [])
+        if source.get("url_strategy") == "first_available":
+            configured = configured[:1]
+        urls = configured
+
+    result = []
+    seen = set()
+    for url in urls:
+        if not isinstance(url, str) or not url.startswith(
+            "https://raw.githubusercontent.com/"
+        ):
+            continue
+        if url not in seen:
+            seen.add(url)
+            result.append(url)
+    return result
+
+
+def build_connect_pages(cache: dict, max_length: int = 3900) -> list[str]:
+    """Build source-by-source raw subscription list without white/black tabs."""
+    sections = []
+    total = 0
+    for source_key, source in config.SOURCES.items():
+        data = cache.get(source_key, {})
+        count = len(data.get("configs") or [])
+        urls = source_subscription_urls(source_key, data)
+        if count <= 0 or not urls:
+            continue
+        total += count
+        name = html.escape(source.get("connect_name") or source.get("name") or source_key)
+        links = "\n".join(html.escape(url, quote=False) for url in urls)
+        sections.append(
+            f"• <b>Подписка {name}</b>\n"
+            f"{links}\n"
+            f"<b>{count} конфигураций</b>"
         )
-        if not rows or len(rows[-1]) == 2:
-            rows.append([button])
+
+    intro = (
+        "<b>Подключить</b>\n\n"
+        "Скопируй raw-ссылку нужного источника и добавь её "
+        "в VPN-клиент как подписку."
+    )
+    footer = f"<b>Всего VLESS: {total}</b>"
+    if not sections:
+        return [f"{intro}\n\nПодписки пока недоступны.\n\n{footer}"]
+
+    pages = []
+    current = intro
+    for section in sections:
+        addition = f"\n\n{section}"
+        if len(current) + len(addition) > max_length and current != intro:
+            pages.append(current)
+            current = "<b>Подключить — продолжение</b>" + addition
         else:
-            rows[-1].append(button)
-    rows.append(
-        [
-            InlineKeyboardButton(
-                "«Скачать полный файл»",
-                callback_data=f"rawfile:{base_filename}",
-                style=KeyboardButtonStyle.SUCCESS,
-            )
-        ]
-    )
-    rows.append(
-        [
-            InlineKeyboardButton(
-                back_label,
-                callback_data=back_data,
-                style=KeyboardButtonStyle.PRIMARY,
-            )
-        ]
-    )
-    return InlineKeyboardMarkup(rows)
+            current += addition
+    footer_block = f"\n\n{footer}"
+    if len(current) + len(footer_block) > max_length:
+        pages.append(current)
+        current = f"<b>Подключить — итог</b>\n\n{footer}"
+    else:
+        current += footer_block
+    pages.append(current)
+    return pages
 
 
-def aggregate_for_filename(filename: str):
-    """Resolve an aggregate or numbered chunk, including old button names."""
-    for aggregate_key, aggregate in config.AGGREGATED_SUBS.items():
-        base_filename = aggregate["filename"]
-        base_name = base_filename.removesuffix(".txt")
-        if filename == base_filename:
-            return aggregate_key, aggregate
-        prefix = f"{base_name}_"
-        if filename.startswith(prefix) and filename.endswith(".txt"):
-            number = filename[len(prefix):-4]
-            if number.isdigit():
-                return aggregate_key, aggregate
-    return None, None
-
-
-def aggregate_back_callback(filename: str) -> str:
-    aggregate_key, _ = aggregate_for_filename(filename)
-    if aggregate_key:
-        candidate = aggregate_key.lower().replace("_full", "")
-        if candidate in {"white", "black", "full"}:
-            return candidate
-    return "home"
-
-
-def protocol_keyboard(agg_key: str):
-    agg = config.AGGREGATED_SUBS.get(agg_key)
-    if not agg:
-        return InlineKeyboardMarkup(
-            [[InlineKeyboardButton(
-                "«Назад»",
-                callback_data="home",
-                style=KeyboardButtonStyle.PRIMARY,
-            )]]
+async def show_connect(query, context):
+    if not CACHE:
+        await update_cache(bot=context.bot)
+    pages = build_connect_pages(CACHE)
+    for index, text in enumerate(pages):
+        await query.message.reply_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=back_keyboard() if index == len(pages) - 1 else None,
         )
-    base = agg["filename"]
-    total = AGGREGATED_CACHE.get(base, {}).get("count", "?")
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    f"«VLESS · {total}»",
-                    callback_data=f"proto:{agg_key}:all",
-                    style=KeyboardButtonStyle.SUCCESS,
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "«Назад»",
-                    callback_data="home",
-                    style=KeyboardButtonStyle.PRIMARY,
-                )
-            ],
-        ]
-    )
+
 
 # ---------- Channel subscription check ----------
 
@@ -432,7 +409,7 @@ async def push_aggregated_to_github(aggregated_results):
         return {}
 
 async def notify_channel_update(bot, old_total, new_total):
-    """Уведомление в канал @vpncrimson об обновлении списков — каждый раз когда обновляю кэш"""
+    """Notify @vpncrimson when source subscription counts change."""
     global LAST_NOTIFY
     if not config.CHANNEL_ID:
         return
@@ -441,7 +418,7 @@ async def notify_channel_update(bot, old_total, new_total):
         diff = new_total - old_total
         sign = f"+{diff}" if diff > 0 else str(diff) if diff != 0 else "0"
         text = (
-            f"<b>Free VPN • Crimson — списки обновлены</b>\n\n"
+            f"<b>Free VPN • Crimson — подписки обновлены</b>\n\n"
             f"Всего VLESS: <b>{new_total}</b> ({sign})\n"
             f"Дата: {now.strftime('%d.%m.%Y %H:%M МСК')}\n\n"
             f"Получить — @wtfparsbot"
@@ -475,6 +452,7 @@ async def _update_cache(categories=None, mode=None, bot=None):
             data["configs"] = fallback
             data["filtered_total"] = len(fallback)
             data["removed"] = len(cached) - len(fallback)
+            data["used_urls"] = list(CACHE[key].get("used_urls") or [])
             data["cache_fallback"] = True
 
         # Только .txt и только VLESS, сразу фильтруем нерабочие
@@ -513,19 +491,6 @@ async def _update_cache(categories=None, mode=None, bot=None):
     except Exception as e:
         logger.error(f"aggregated error: {e}")
     return result
-
-def local_subscription_path(filename: str):
-    """Return an active generated file or, before preload, a bootstrap copy."""
-    _, aggregate = aggregate_for_filename(filename)
-    if aggregate and AGGREGATED_CACHE and filename not in AGGREGATED_CACHE:
-        # The name belongs to an old aggregate generation. Do not silently
-        # serve a stale committed chunk after the active map has switched.
-        return None
-    for path in (DATA_DIR / filename, Path(__file__).parent.parent / filename):
-        if path.is_file():
-            return path
-    return None
-
 
 # ---------- Media helpers — редактируем одно сообщение ----------
 
@@ -629,79 +594,6 @@ async def handle_main_menu_text(update: Update, context: ContextTypes.DEFAULT_TY
         await send_initial_banner(update, "main", config.WELCOME_TEXT, main_keyboard(uid))
         return True
     return False
-
-async def show_outdated_file(query, fname: str, back_data: str = "home"):
-    _, aggregate = aggregate_for_filename(fname)
-    if aggregate:
-        base_filename = aggregate["filename"]
-        current_chunks = AGGREGATED_CHUNKS.get(base_filename, [])
-        text = (
-            f"<b>{fname} больше не существует</b>\n\n"
-            "Количество конфигураций изменилось, поэтому пакеты были пересобраны. "
-            "Выбери актуальный пакет ниже."
-        )
-        keyboard = (
-            chunks_keyboard(base_filename, current_chunks, back_data=back_data)
-            if current_chunks
-            else back_keyboard(back_data)
-        )
-    else:
-        text = "<b>Файл больше не существует</b>\n\nОткрой список заново."
-        keyboard = back_keyboard(back_data)
-    await edit_message_with_banner(query, "configs", text, keyboard)
-
-
-async def send_chunk_file(query, fname, back_data="home"):
-    path = local_subscription_path(fname)
-    if path is None:
-        await query.message.reply_text("Файл изменился, обновляю список пакетов…")
-        await update_cache(bot=query.get_bot() if hasattr(query, "get_bot") else None)
-        path = local_subscription_path(fname)
-
-    if path is None:
-        await show_outdated_file(query, fname, back_data)
-        return
-
-    _, aggregate = aggregate_for_filename(fname)
-    title = fname
-    if aggregate:
-        title = aggregate["profile_title"]
-        if aggregate["filename"] != fname:
-            title = f"{title} — {fname}"
-    cnt = AGGREGATED_CACHE.get(fname, {}).get("count", "?")
-    text = (
-        f"<b>{title}</b>\n\n"
-        f"Конфигов в файле: <b>{cnt}</b>\n\n"
-        f"{config.FILE_USAGE_TEXT}"
-    )
-    kb = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "«Скачать .txt»",
-                    callback_data=f"rawfile:{fname}",
-                    style=KeyboardButtonStyle.SUCCESS,
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "«Назад»",
-                    callback_data=back_data,
-                    style=KeyboardButtonStyle.PRIMARY,
-                )
-            ],
-        ]
-    )
-    await edit_message_with_banner(query, "configs", text, kb)
-    try:
-        with open(path, "rb") as document:
-            await query.message.reply_document(
-                document=document,
-                filename=fname,
-                caption=f"{title} • {cnt}",
-            )
-    except Exception as exc:
-        logger.error("send chunk %s failed: %s", fname, exc)
 
 async def handle_admin_clean(query):
     try:
@@ -913,104 +805,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_admin_clean(query)
             return
 
-    if data == "white":
-        agg_key = "WHITE_FULL"
-        agg = config.AGGREGATED_SUBS[agg_key]
-        base = agg["filename"]
-        if base not in AGGREGATED_PROTO_COUNTS:
-            await update_cache(bot=context.bot)
-        total = AGGREGATED_CACHE.get(base, {}).get("count", "?")
-        text = f"<b>Белые списки</b>\n\nВсего VLESS: <b>{total}</b>\n\nВыбери действие:"
-        await edit_message_with_banner(query, "protocols", text, protocol_keyboard(agg_key))
-        return
-
-    if data == "black":
-        agg_key = "BLACK_FULL"
-        agg = config.AGGREGATED_SUBS[agg_key]
-        base = agg["filename"]
-        if base not in AGGREGATED_PROTO_COUNTS:
-            await update_cache(bot=context.bot)
-        total = AGGREGATED_CACHE.get(base, {}).get("count", "?")
-        text = f"<b>Черные списки</b>\n\nВсего VLESS: <b>{total}</b>\n\nВыбери действие:"
-        await edit_message_with_banner(query, "protocols", text, protocol_keyboard(agg_key))
-        return
-
-    if data == "full":
-        agg_key = "FULL"
-        agg = config.AGGREGATED_SUBS[agg_key]
-        base = agg["filename"]
-        if base not in AGGREGATED_PROTO_COUNTS:
-            await update_cache(bot=context.bot)
-        total = AGGREGATED_CACHE.get(base, {}).get("count", "?")
-        text = f"<b>Полный список</b>\n\nВсего VLESS: <b>{total}</b>\n\nВыбери действие:"
-        await edit_message_with_banner(query, "protocols", text, protocol_keyboard(agg_key))
-        return
-
-    if data.startswith("proto:"):
-        try:
-            _, agg_key, proto = data.split(":", 2)
-        except:
-            await query.answer("Ошибка", show_alert=True)
-            return
-        agg = config.AGGREGATED_SUBS.get(agg_key)
-        if not agg:
-            await query.message.reply_text("Неизвестный список")
-            return
-        base = agg["filename"]
-        base_title = agg["profile_title"]
-        fname = base
-        chunks = AGGREGATED_CHUNKS.get(fname, [])
-        cnt = AGGREGATED_CACHE.get(fname, {}).get("count", "?")
-        back_target = agg_key.lower().replace("_full","")
-        if back_target not in ("white","black","full"):
-            back_target = "home"
-        text = (
-            f"<b>{base_title}</b>\n\n"
-            f"Всего VLESS: <b>{cnt}</b>\n\n"
-            "Выбери пакет — бот отправит готовый <code>.txt</code>-файл."
-        )
-        if chunks:
-            kb = chunks_keyboard(fname, chunks, back_data=back_target, back_label="«К протоколам»")
-        else:
-            kb = InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            "«Скачать .txt»",
-                            callback_data=f"rawfile:{fname}",
-                            style=KeyboardButtonStyle.SUCCESS,
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "«К протоколам»",
-                            callback_data=back_target,
-                            style=KeyboardButtonStyle.PRIMARY,
-                        )
-                    ],
-                ]
-            )
-        await edit_message_with_banner(query, "configs", text, kb)
-        return
-
-    if data.startswith("chunk:"):
-        fname = data.split(":", 1)[1]
-        await send_chunk_file(
-            query,
-            fname,
-            back_data=aggregate_back_callback(fname),
-        )
-        return
-
-    # Compatibility for buttons left in old Telegram messages: every old
-    # link/base64/QR action now sends the corresponding .txt file instead.
-    if data.startswith(("rawcopy:", "b64copy:", "qrfile:", "rawfile:")):
-        fname = data.split(":", 1)[1]
-        await send_chunk_file(
-            query,
-            fname,
-            back_data=aggregate_back_callback(fname),
-        )
+    if (
+        data in {"connect", "white", "black", "full"}
+        or data.startswith(("proto:", "chunk:", "rawcopy:", "b64copy:", "qrfile:", "rawfile:"))
+    ):
+        # Old list/file buttons are redirected to the new source-subscription view.
+        await show_connect(query, context)
         return
 
 # ---------- Message handlers ----------
@@ -1049,7 +849,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_text_handler))
     app.add_handler(CallbackQueryHandler(callback_handler))
-    print(f"Crimson bot @vpncrimson интервальный {config.UPDATE_INTERVAL}м — только .txt на репо")
+    print(f"Crimson bot @vpncrimson интервальный {config.UPDATE_INTERVAL}м — GitHub raw-подписки")
 
     async def _preload():
         try:
