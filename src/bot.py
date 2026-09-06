@@ -1,10 +1,8 @@
 import os
 import asyncio
 import logging
-import base64
 import json
 from datetime import datetime, timezone, timedelta
-from io import BytesIO
 from pathlib import Path
 
 from telegram import (
@@ -37,7 +35,6 @@ from parser import (
 from subscription import (
     CHUNK_SIZE,
     cleanup_stale_aggregate_chunks,
-    generate_qr_bytes,
     save_aggregated_chunks,
     save_subscription_files,
 )
@@ -374,7 +371,9 @@ def build_aggregated_configs():
         # parameter order. Deduplicate by normalized VLESS identity globally.
         all_cfgs = deduplicate_configs(all_cfgs)
         try:
-            full_path, full_b64, full_content, full_b64c, chunk_infos = save_aggregated_chunks(str(DATA_DIR), filename, title, all_cfgs, CHUNK_SIZE)
+            _, full_content, chunk_infos = save_aggregated_chunks(
+                str(DATA_DIR), filename, title, all_cfgs, CHUNK_SIZE
+            )
             results[filename] = {"content": full_content, "count": len(all_cfgs), "configs": all_cfgs}
             chunk_list = []
             for cfname, ctitle, cnt, ccontent in chunk_infos:
@@ -387,38 +386,16 @@ def build_aggregated_configs():
     return results, chunk_map, proto_counts_map
 
 
-def activate_aggregated_configs(results, chunk_map, proto_counts_map, raw_map=None):
+def activate_aggregated_configs(results, chunk_map, proto_counts_map):
     """Atomically expose one complete generated/publication generation."""
     global AGGREGATED_CACHE, AGGREGATED_CHUNKS, AGGREGATED_PROTO_COUNTS
-    raw_map = raw_map or {}
-    new_cache = {}
-    for filename, info in results.items():
-        relative_path = (
-            f"{config.GITHUB_SUB_PATH}/{filename}"
-            if config.GITHUB_SUB_PATH
-            else filename
-        ).lstrip("/")
-        raw_url = raw_map.get(relative_path, "")
-        if not raw_url and not config.GITHUB_SUB_PATH:
-            # A committed bootstrap file is safe only when it has exactly the
-            # same bytes as the generation now being activated.
-            repository_path = Path(__file__).parent.parent / filename
-            try:
-                if (
-                    repository_path.is_file()
-                    and repository_path.read_text(encoding="utf-8") == info["content"]
-                ):
-                    raw_url = (
-                        f"https://raw.githubusercontent.com/{config.GITHUB_REPO}/"
-                        f"{config.GITHUB_BRANCH}/{filename}"
-                    )
-            except OSError:
-                pass
-        new_cache[filename] = {
+    new_cache = {
+        filename: {
             "count": info["count"],
             "content": info["content"],
-            "raw_url": raw_url,
         }
+        for filename, info in results.items()
+    }
 
     # No await occurs in this function, so handlers observe either the old map
     # or the complete new map, never a partially switched generation.
@@ -525,23 +502,17 @@ async def _update_cache(categories=None, mode=None, bot=None):
     new_total = sum(len(v.get("configs", [])) for v in CACHE.values())
     try:
         agg, chunk_map, proto_counts_map = build_aggregated_configs()
-        raw_map = {}
         if config.GITHUB_TOKEN and agg:
             # Keep the previous keyboard generation active until all new files
             # become visible together in one GitHub ref update.
-            raw_map = await push_aggregated_to_github(agg)
-        activate_aggregated_configs(agg, chunk_map, proto_counts_map, raw_map)
+            await push_aggregated_to_github(agg)
+        activate_aggregated_configs(agg, chunk_map, proto_counts_map)
         # Уведомление в канал раз в час, если есть изменения
         if bot and old_total != new_total:
             asyncio.create_task(notify_channel_update(bot, old_total, new_total))
     except Exception as e:
         logger.error(f"aggregated error: {e}")
     return result
-
-def get_raw_url(filename: str) -> str:
-    """Return only a verified GitHub raw URL for a published .txt file."""
-    return AGGREGATED_CACHE.get(filename, {}).get("raw_url", "")
-
 
 def local_subscription_path(filename: str):
     """Return an active generated file or, before preload, a bootstrap copy."""
@@ -698,31 +669,20 @@ async def send_chunk_file(query, fname, back_data="home"):
         if aggregate["filename"] != fname:
             title = f"{title} — {fname}"
     cnt = AGGREGATED_CACHE.get(fname, {}).get("count", "?")
-    raw = get_raw_url(fname)
-    link_text = (
-        f"<code>{raw}</code>"
-        if raw
-        else "Публичная ссылка пока недоступна; файл можно скачать напрямую."
+    text = (
+        f"<b>{title}</b>\n\n"
+        f"Конфигов в файле: <b>{cnt}</b>\n\n"
+        f"{config.FILE_USAGE_TEXT}"
     )
-    text = f"<b>{title}</b>\n\n{link_text}\n\nКонфигов: <b>{cnt}</b>"
-    actions = [
-        InlineKeyboardButton(
-            "«Скачать файл»",
-            callback_data=f"rawfile:{fname}",
-            style=KeyboardButtonStyle.SUCCESS,
-        )
-    ]
-    if raw:
-        actions.append(
-            InlineKeyboardButton(
-                "«Копировать ссылку»",
-                callback_data=f"rawcopy:{fname}",
-                style=KeyboardButtonStyle.PRIMARY,
-            )
-        )
     kb = InlineKeyboardMarkup(
         [
-            actions,
+            [
+                InlineKeyboardButton(
+                    "«Скачать .txt»",
+                    callback_data=f"rawfile:{fname}",
+                    style=KeyboardButtonStyle.SUCCESS,
+                )
+            ],
             [
                 InlineKeyboardButton(
                     "«Назад»",
@@ -1001,37 +961,26 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fname = base
         chunks = AGGREGATED_CHUNKS.get(fname, [])
         cnt = AGGREGATED_CACHE.get(fname, {}).get("count", "?")
-        raw = get_raw_url(fname)
         back_target = agg_key.lower().replace("_full","")
         if back_target not in ("white","black","full"):
             back_target = "home"
-        link_text = (
-            f"<code>{raw}</code>"
-            if raw
-            else "Публичная ссылка пока недоступна; пакеты можно скачать напрямую."
+        text = (
+            f"<b>{base_title}</b>\n\n"
+            f"Всего VLESS: <b>{cnt}</b>\n\n"
+            "Выбери пакет — бот отправит готовый <code>.txt</code>-файл."
         )
-        text = f"<b>{base_title}</b>\n\n{link_text}\n\nКонфигов: <b>{cnt}</b>\n\nВыбери пакет:"
         if chunks:
             kb = chunks_keyboard(fname, chunks, back_data=back_target, back_label="«К протоколам»")
         else:
-            actions = [
-                InlineKeyboardButton(
-                    "«Скачать файл»",
-                    callback_data=f"rawfile:{fname}",
-                    style=KeyboardButtonStyle.SUCCESS,
-                )
-            ]
-            if raw:
-                actions.append(
-                    InlineKeyboardButton(
-                        "«Копировать»",
-                        callback_data=f"rawcopy:{fname}",
-                        style=KeyboardButtonStyle.PRIMARY,
-                    )
-                )
             kb = InlineKeyboardMarkup(
                 [
-                    actions,
+                    [
+                        InlineKeyboardButton(
+                            "«Скачать .txt»",
+                            callback_data=f"rawfile:{fname}",
+                            style=KeyboardButtonStyle.SUCCESS,
+                        )
+                    ],
                     [
                         InlineKeyboardButton(
                             "«К протоколам»",
@@ -1041,7 +990,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     ],
                 ]
             )
-            text = f"<b>{base_title}</b>\n\n{link_text}\n\nКонфигов: <b>{cnt}</b>"
         await edit_message_with_banner(query, "configs", text, kb)
         return
 
@@ -1054,93 +1002,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if data.startswith("rawcopy:"):
+    # Compatibility for buttons left in old Telegram messages: every old
+    # link/base64/QR action now sends the corresponding .txt file instead.
+    if data.startswith(("rawcopy:", "b64copy:", "qrfile:", "rawfile:")):
         fname = data.split(":", 1)[1]
-        if local_subscription_path(fname) is None:
-            await update_cache(bot=context.bot)
-        if local_subscription_path(fname) is None:
-            await show_outdated_file(query, fname, aggregate_back_callback(fname))
-            return
-        raw = get_raw_url(fname)
-        if not raw:
-            await query.message.reply_text(
-                "Публичная ссылка пока недоступна. Скачай файл напрямую.",
-                reply_markup=back_keyboard(aggregate_back_callback(fname)),
-            )
-            return
-        await query.message.reply_text(
-            f"<code>{raw}</code>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=back_keyboard(aggregate_back_callback(fname)),
+        await send_chunk_file(
+            query,
+            fname,
+            back_data=aggregate_back_callback(fname),
         )
-        return
-
-    if data.startswith("b64copy:"):
-        fname = data.split(":", 1)[1]
-        path = local_subscription_path(fname)
-        if path is None:
-            await update_cache(bot=context.bot)
-            path = local_subscription_path(fname)
-        if path is None:
-            await show_outdated_file(query, fname, aggregate_back_callback(fname))
-            return
-        content = path.read_bytes()
-        encoded = base64.b64encode(content)
-        if len(encoded) < 4000:
-            await query.message.reply_text(
-                f"<code>{encoded.decode('ascii')}</code>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=back_keyboard(aggregate_back_callback(fname)),
-            )
-        else:
-            document = BytesIO(encoded)
-            document.name = fname.replace(".txt", "_base64.txt")
-            await query.message.reply_document(
-                document=document,
-                filename=document.name,
-            )
-        return
-
-    if data.startswith("qrfile:"):
-        fname = data.split(":", 1)[1]
-        if local_subscription_path(fname) is None:
-            await update_cache(bot=context.bot)
-        if local_subscription_path(fname) is None:
-            await show_outdated_file(query, fname, aggregate_back_callback(fname))
-            return
-        link = get_raw_url(fname)
-        if not link:
-            await query.message.reply_text(
-                "QR недоступен, пока у файла нет публичной ссылки.",
-                reply_markup=back_keyboard(aggregate_back_callback(fname)),
-            )
-            return
-        try:
-            qr_bytes = generate_qr_bytes(link)
-            await query.message.reply_photo(photo=qr_bytes, caption=f"{fname}\n{link}")
-        except Exception as e:
-            logger.error(f"qr error: {e}")
-            await query.message.reply_text(f"QR ошибка: {e}")
-        return
-
-    if data.startswith("rawfile:"):
-        fname = data.split(":", 1)[1]
-        path = local_subscription_path(fname)
-        if path is None:
-            await update_cache(bot=context.bot)
-            path = local_subscription_path(fname)
-        if path is None:
-            await show_outdated_file(query, fname, aggregate_back_callback(fname))
-            return
-        try:
-            with open(path, "rb") as document:
-                await query.message.reply_document(document=document, filename=fname)
-        except Exception as exc:
-            logger.error("send subscription %s failed: %s", fname, exc)
-            await query.message.reply_text(
-                "Не удалось отправить файл. Открой список заново.",
-                reply_markup=back_keyboard(aggregate_back_callback(fname)),
-            )
         return
 
 # ---------- Message handlers ----------

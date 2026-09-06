@@ -8,12 +8,13 @@ import re
 import uuid
 from collections import Counter
 from typing import Dict, Iterable, List, Optional, Tuple
-from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 
 import aiohttp
 
 from config import (
     AUTO_DISCOVERY,
+    DISCOVERY_MAX_CONFIGS,
     DISCOVERY_MAX_FEEDS,
     DISCOVERY_MAX_REPOS,
     DISCOVERY_MIN_VALID,
@@ -45,12 +46,7 @@ MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_DECODE_DEPTH = 3
 MAX_DECODED_ITEMS = 10_000
 DISCOVERY_MAX_FILE_BYTES = 8 * 1024 * 1024
-DISCOVERY_MAX_CONFIGS_PER_FEED = 2_000
-DISCOVERY_MAX_CONFIGS_TOTAL = 10_000
-DISCOVERY_URL_REGEX = re.compile(
-    r"https://(?:raw\.githubusercontent\.com|github\.com)/[^\s<>\[\]()\"'`]+",
-    re.IGNORECASE,
-)
+DISCOVERY_MAX_CONFIGS_PER_FEED = 300
 DISCOVERY_ALLOWED_SUFFIXES = {"", ".txt", ".conf", ".list", ".json", ".yaml", ".yml"}
 DISCOVERY_EXCLUDED_NAMES = {
     "readme",
@@ -466,70 +462,41 @@ async def fetch_text(session: aiohttp.ClientSession, url: str) -> str:
 
 
 def _discovery_url_score(url: str) -> int:
-    """Rank likely subscription payloads without downloading an entire repo."""
-    path = unquote(urlsplit(url).path).lower()
-    name = path.rsplit("/", 1)[-1]
+    """Accept only GitHub files matching strict VLESS/VPN/list filters."""
+    parsed = urlsplit(url)
+    if (parsed.hostname or "").lower() != "raw.githubusercontent.com":
+        return -100
+    parts = [unquote(part).lower() for part in parsed.path.split("/") if part]
+    if len(parts) < 4:
+        return -100
+    name = parts[-1]
     stem, dot, suffix = name.rpartition(".")
     suffix = f".{suffix}" if dot else ""
     if suffix not in DISCOVERY_ALLOWED_SUFFIXES:
         return -100
-    tokens = set(re.split(r"[^a-z0-9]+", stem or name))
-    if tokens & DISCOVERY_EXCLUDED_NAMES:
+
+    file_tokens = set(re.split(r"[^a-z0-9]+", "/".join(parts[3:])))
+    if file_tokens & DISCOVERY_EXCLUDED_NAMES:
         return -100
-    score = 0
-    if "vless" in path:
-        score += 20
-    if "subscription" in path or "/sub" in path or name.startswith("sub"):
+    searchable = "/".join([parts[1], *parts[3:]])
+    if "vless" not in searchable:
+        return -100
+    secondary_filters = ("vpn", "config", "subscription", "sub", "list", "blacklist")
+    if not any(term in searchable for term in secondary_filters):
+        return -100
+
+    score = 20
+    if "blacklist" in searchable or "black" in file_tokens:
+        score += 12
+    if "vpn" in searchable:
         score += 8
-    if "config" in path or "node" in path:
+    if "config" in searchable:
+        score += 6
+    if "list" in searchable:
         score += 5
-    if "all" in tokens or "mixed" in tokens:
-        score += 2
+    if "subscription" in searchable or "sub" in file_tokens:
+        score += 4
     return score
-
-
-def _normalize_discovery_url(url: str) -> Optional[str]:
-    url = (url or "").rstrip(".,;:!?\\")
-    if "..." in url:
-        return None
-    parsed = urlsplit(url)
-    host = (parsed.hostname or "").lower()
-    if host == "raw.githubusercontent.com":
-        return urlunsplit(("https", host, parsed.path, parsed.query, ""))
-    if host != "github.com":
-        return None
-
-    parts = [part for part in parsed.path.split("/") if part]
-    if len(parts) < 5 or parts[2] not in {"blob", "raw"}:
-        return None
-    remainder = parts[3:]
-    if remainder[:2] == ["refs", "heads"] and len(remainder) >= 4:
-        branch = remainder[2]
-        file_parts = remainder[3:]
-    else:
-        branch = remainder[0]
-        file_parts = remainder[1:]
-    if not branch or not file_parts:
-        return None
-    raw_path = "/".join([parts[0], parts[1], branch, *file_parts])
-    return f"https://raw.githubusercontent.com/{raw_path}"
-
-
-def extract_discovery_urls(text: str) -> List[str]:
-    """Extract and rank GitHub raw/blob URLs from maintained index pages."""
-    candidates = {}
-    for match in DISCOVERY_URL_REGEX.finditer(text or ""):
-        url = _normalize_discovery_url(match.group(0))
-        if not url:
-            continue
-        score = _discovery_url_score(url)
-        if score < 1:
-            continue
-        candidates[url] = max(score, candidates.get(url, -100))
-    return [
-        url
-        for url, _ in sorted(candidates.items(), key=lambda item: (-item[1], item[0]))
-    ]
 
 
 async def _fetch_json(session: aiohttp.ClientSession, url: str):
@@ -546,24 +513,16 @@ async def discover_github_feed_urls(
     session: aiohttp.ClientSession,
     source: Dict,
 ) -> Tuple[List[str], List[str]]:
-    """Find a bounded set of recently maintained public VLESS feed files.
+    """Find a bounded set of public feeds through GitHub search only.
 
-    Discovery uses maintained index pages plus GitHub repository search. Only
-    GitHub-hosted text-like files are considered, and every payload still has
-    to pass the normal VLESS validator before it can enter an aggregate.
+    Repository and file paths must match strict VLESS/VPN/config/list filters.
+    Every downloaded payload then passes the normal VLESS validator.
     """
     if not AUTO_DISCOVERY:
         return [], ["автопоиск отключён"]
 
     errors = []
     candidates = []
-    for index_url in source.get("index_urls", []):
-        index_text = await fetch_text(session, index_url)
-        if not index_text:
-            errors.append(f"{index_url} — индекс недоступен")
-            continue
-        candidates.extend(extract_discovery_urls(index_text))
-
     repositories = {}
     for query in source.get("search_queries", []):
         search_url = "https://api.github.com/search/repositories?" + urlencode(
@@ -594,24 +553,28 @@ async def discover_github_feed_urls(
         if len(repositories) >= DISCOVERY_MAX_REPOS:
             break
 
-    for full_name in list(repositories)[:DISCOVERY_MAX_REPOS]:
-        contents_url = f"https://api.github.com/repos/{full_name}/contents"
-        payload = await _fetch_json(session, contents_url)
-        if not isinstance(payload, list):
-            errors.append(f"{full_name} — не удалось прочитать корень репозитория")
+    for full_name, repository in list(repositories.items())[:DISCOVERY_MAX_REPOS]:
+        branch = repository.get("default_branch") or "main"
+        tree_url = (
+            f"https://api.github.com/repos/{full_name}/git/trees/"
+            f"{quote(branch, safe='')}?recursive=1"
+        )
+        payload = await _fetch_json(session, tree_url)
+        if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):
+            errors.append(f"{full_name} — не удалось прочитать GitHub tree")
             continue
         ranked = []
-        for item in payload:
-            if not isinstance(item, dict) or item.get("type") != "file":
+        for item in payload["tree"]:
+            if not isinstance(item, dict) or item.get("type") != "blob":
                 continue
-            download_url = item.get("download_url")
+            path = item.get("path", "")
             size = item.get("size")
-            if (
-                not download_url
-                or not isinstance(size, int)
-                or not 0 < size <= DISCOVERY_MAX_FILE_BYTES
-            ):
+            if not path or not isinstance(size, int) or not 0 < size <= DISCOVERY_MAX_FILE_BYTES:
                 continue
+            download_url = (
+                f"https://raw.githubusercontent.com/{full_name}/"
+                f"{quote(branch, safe='')}/{quote(path, safe='/%')}"
+            )
             score = _discovery_url_score(download_url)
             if score >= 1:
                 ranked.append((score, download_url))
@@ -624,22 +587,29 @@ async def discover_github_feed_urls(
         for configured_source in SOURCES.values()
         for url in configured_source.get("urls", [])
     }
+    configured_repositories = {
+        "/".join(parts[:2]).lower()
+        for url in configured_urls
+        if len(parts := [part for part in urlsplit(url).path.split("/") if part]) >= 2
+    }
     unique = []
     seen = set()
     per_repository = Counter()
     for url in sorted(set(candidates), key=lambda item: (-_discovery_url_score(item), item)):
-        normalized = _normalize_discovery_url(url)
-        if not normalized or normalized in configured_urls or normalized in seen:
+        if _discovery_url_score(url) < 1 or url in configured_urls or url in seen:
             continue
-        parts = [part for part in urlsplit(normalized).path.split("/") if part]
-        repository = "/".join(parts[:2]).lower() if len(parts) >= 2 else normalized
-        # One large country-by-country repository must not crowd every other
-        # independently maintained feed out of the bounded candidate set.
-        if per_repository[repository] >= 2:
+        parts = [part for part in urlsplit(url).path.split("/") if part]
+        repository = "/".join(parts[:2]).lower() if len(parts) >= 2 else url
+        # Known repositories are already fetched explicitly; discovery must add
+        # independent sources rather than another file/mirror from the same repo.
+        if repository in configured_repositories:
+            continue
+        # Keep one feed per repository so mirrors cannot dominate the result.
+        if per_repository[repository] >= 1:
             continue
         per_repository[repository] += 1
-        seen.add(normalized)
-        unique.append(normalized)
+        seen.add(url)
+        unique.append(url)
         if len(unique) >= DISCOVERY_MAX_FEEDS:
             break
     return unique, errors
@@ -670,12 +640,11 @@ async def fetch_discovered_category(
             continue
         used_urls.append(url)
         raw_total += extracted_count
-        configs.extend(valid)
-        if len(configs) >= DISCOVERY_MAX_CONFIGS_TOTAL:
-            configs = configs[:DISCOVERY_MAX_CONFIGS_TOTAL]
+        configs = deduplicate_configs(
+            [*configs, *valid[:DISCOVERY_MAX_CONFIGS_PER_FEED]]
+        )[:DISCOVERY_MAX_CONFIGS]
+        if len(configs) >= DISCOVERY_MAX_CONFIGS:
             break
-
-    configs = deduplicate_configs(configs)
     if not configs:
         errors.append("автопоиск не нашёл подходящих VLESS-подписок")
     return {
@@ -689,7 +658,7 @@ async def fetch_discovered_category(
         "validation_mode": mode,
         "invalid_reasons": {},
         "errors": errors,
-        "urls": source.get("index_urls", []),
+        "urls": [],
         "used_urls": used_urls,
         "discovered_urls": candidate_urls,
         "raw_text": "\n".join(f"# Discovered: {url}" for url in used_urls),
@@ -937,11 +906,6 @@ def make_subscription_content(configs: List[str], header: str = "") -> str:
         lines.append(header)
     lines.extend(configs)
     return "\n".join(lines)
-
-
-def make_base64_subscription(configs: List[str], header: str = "") -> str:
-    content = make_subscription_content(configs, header)
-    return base64.b64encode(content.encode("utf-8")).decode("ascii")
 
 
 def parse_vless_info(link: str) -> Dict:

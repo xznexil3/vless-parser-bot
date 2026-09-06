@@ -1,6 +1,6 @@
 # 🛰️ VLESS Parser Bot — чёрные и белые списки
 
-Telegram-бот собирает публичные VLESS-конфигурации, проверяет их и публикует plain/base64-подписки для Happ, Hiddify, Streisand, v2rayNG, NekoRay и других совместимых клиентов.
+Telegram-бот собирает публичные VLESS-конфигурации из отобранных GitHub-источников, проверяет их и отправляет пользователям готовые `.txt`-файлы для Happ, Hiddify, Streisand, v2rayNG, NekoRay и других совместимых клиентов.
 
 - **⬜ Белые списки** — конфигурации для сетей с режимом «белых списков».
 - **⬛ Чёрные списки** — конфигурации для обычных блокировок.
@@ -8,29 +8,11 @@ Telegram-бот собирает публичные VLESS-конфигураци
 
 ## 🔗 Источники
 
-В белый агрегат входят все 11 провайдеров:
+Парсер загружает конфигурации только с GitHub. Широкий `collection`, внешние сайты, GitVerse, Codeberg, Vercel, S3 и индексный `internet_discovery` удалены.
 
-| № | Провайдер | Основной feed |
-|---:|---|---|
-| 1 | Сборник подписок против БС | VALCHIK / Codeberg `obhod_WL` |
-| 2 | zieng2 | `zieng2/wl` |
-| 3 | EtoNeYa | `etoneya.su/whitelist` |
-| 4 | igareck | `WHITE-CIDR-RU-all.txt` |
-| 5 | CID VPN | `CidVpn/cid-vpn-config` + CID White |
-| 6 | wrtrmmu | nowmeow whitelist API |
-| 7 | wlrus.lol | wlrus.lol, GitVerse и S3-зеркало |
-| 8 | ByeWhiteLists 2.0 | `ByeWhiteLists/ByeWhiteLists2` |
-| 9 | Vercel | `white-lists.vercel.app/api/filter?code=RU` |
-| 10 | Ghost-vpn.ru | две WhiteListVpn-подписки |
-| 11 | VPN bolt | `RUVIPIEN/russian-white-bolt_fix` |
+Белые GitHub feed-ы: zieng2, igareck, CID VPN, ByeWhiteLists 2.0 и Ghost VPN. Чёрные GitHub feed-ы: igareck, Ghost VPN и AetrisVPN.
 
-Точные URL и порядок зеркал находятся в [`src/config.py`](src/config.py). Для зеркал используется стратегия `first_available`; независимые части одного источника загружаются стратегией `all`.
-
-> На момент последней проверки endpoint Vercel возвращает HTTP 404. Он сохранён как канонический источник и автоматически снова начнёт участвовать в агрегате, если deployment восстановят. Ошибка одного провайдера не останавливает остальные источники.
-
-Чёрные feed-ы igareck, EtoNeYa, Ghost VPN и автообновляемая подписка [AetrisVPN](https://raw.githubusercontent.com/flaafix/AetrisVPN-black-list/main/configs.txt) зарегистрированы отдельно и не смешиваются с белым агрегатом. Бот сам загружает их из интернета при старте и каждом периодическом обновлении, оставляет только валидные VLESS и объединяет результат в `BLACK_FULL.txt` и `FULL.txt`.
-
-Дополнительно включён ограниченный автопоиск: бот читает поддерживаемый индекс VLESS-подписок, ищет недавно обновлённые публичные репозитории через GitHub API, выбирает только похожие на подписки текстовые файлы и загружает их параллельно. Неизвестные сайты не обходятся произвольно: это защищает Railway от SSRF, огромных ответов и бесконечного crawler-а. Один feed принимается только при наличии минимум пяти валидных VLESS; количество репозиториев, файлов и конфигураций жёстко ограничено.
+Дополнительный строгий `github_discovery` использует GitHub Repository Search и Git Tree API. Репозиторий и путь файла должны одновременно соответствовать VLESS и дополнительным фильтрам `vpn`, `config`, `subscription`, `list` или `blacklist`. Берётся не больше одного feed-а из одного репозитория, максимум 8 feed-ов и 1200 уникальных конфигураций за обновление. Каждый найденный feed принимается только при наличии минимум 10 валидных VLESS.
 
 ## ✅ Извлечение и проверка
 
@@ -69,13 +51,14 @@ TCP-проверка подтверждает доступность endpoint-а
 - интерактивное Telegram-меню с цветными inline-кнопками Bot API 9.4;
 - семантические цвета: синий для навигации, зелёный для списков/скачивания, красный для помощи, админки и очистки;
 - отдельные `WHITE_FULL.txt`, `BLACK_FULL.txt` и `FULL.txt`;
-- plain-файлы, base64-представление, chunks и QR-коды;
+- отправка только обычных `.txt`-файлов, без URL, base64 и QR;
+- памятка по импорту файла в разделе помощи и после выбора пакета;
 - автообновление с настраиваемым интервалом;
 - атомарная публикация всех агрегатов в GitHub одним commit с удалением устаревших chunks;
 - синхронизированная смена карты кнопок и файлов без ссылок на отсутствующие пакеты;
 - обработка старых кнопок вроде `BLACK_FULL_6.txt` с переходом к актуальным пакетам;
 - ручная строгая проверка одного вставленного VLESS URI;
-- только прямые GitHub Raw-ссылки на опубликованные `.txt`-файлы, без промежуточных доменов.
+- отсутствие пользовательских subscription-ссылок: конфигурации выдаются файлами.
 
 ## 🚀 Запуск
 
@@ -117,9 +100,10 @@ docker logs -f vless-parser-bot
 | `CHECK_MODE` | `none`, `syntax` или `tcp` | `syntax` |
 | `UPDATE_INTERVAL` | Интервал автообновления, минут | `60` |
 | `AUTO_DISCOVERY` | Автопоиск новых публичных GitHub VLESS feed-ов | `true` |
-| `DISCOVERY_MAX_REPOS` | Максимум репозиториев за один поиск | `6` |
-| `DISCOVERY_MAX_FEEDS` | Максимум найденных файлов за обновление | `20` |
-| `DISCOVERY_MIN_VALID` | Минимум валидных VLESS для принятия feed-а | `5` |
+| `DISCOVERY_MAX_REPOS` | Максимум GitHub-репозиториев за один поиск | `6` |
+| `DISCOVERY_MAX_FEEDS` | Максимум найденных файлов за обновление | `8` |
+| `DISCOVERY_MIN_VALID` | Минимум валидных VLESS для принятия feed-а | `10` |
+| `DISCOVERY_MAX_CONFIGS` | Максимум конфигураций из автопоиска | `1200` |
 | `GITHUB_TOKEN` | Токен для публикации агрегатов | — |
 | `GITHUB_REPO` | Репозиторий агрегатов | `xznexil3/vless-parser-bot` |
 | `GITHUB_BRANCH` | Ветка публикации `.txt`-файлов | `main` |
@@ -128,7 +112,7 @@ docker logs -f vless-parser-bot
 ## 🧠 Pipeline
 
 ```text
-known providers + bounded GitHub discovery
+selected GitHub feeds + strict filtered GitHub discovery
   → bounded fetch
   → plain / escaped / base64 extraction
   → strict VLESS validation
@@ -136,7 +120,7 @@ known providers + bounded GitHub discovery
   → optional bounded TCP checks
   → source cache
   → WHITE / BLACK / FULL aggregation
-  → plain + base64 + chunks
+  → atomic `.txt` files and chunks
 ```
 
 ## 🧪 Тесты
@@ -146,7 +130,7 @@ python -m unittest discover -s tests -v
 python -m py_compile src/*.py tests/*.py
 ```
 
-Тесты покрывают plain/base64/escaped extraction, VLESS/Reality validation, private host rejection, normalized deduplication, mirror fallback, ограниченный GitHub discovery, endpoint check deduplication, 11 обязательных белых провайдеров, AetrisVPN, цветовые стили кнопок, GitHub Raw `.txt`-ссылки и очистку устаревших chunks.
+Тесты покрывают plain/base64/escaped extraction входных данных, VLESS/Reality validation, private host rejection, normalized deduplication, строгие GitHub-фильтры, лимиты discovery, endpoint check deduplication, файловый интерфейс, цветовые стили кнопок и очистку устаревших chunks.
 
 ## 📂 Структура
 
@@ -156,7 +140,7 @@ vless-parser-bot/
 │   ├── bot.py          # Telegram-бот и admin cleanup
 │   ├── config.py       # источники, зеркала и агрегаты
 │   ├── parser.py       # fetch/extract/validate/dedup/TCP
-│   ├── subscription.py # atomic plain/base64/chunk generation
+│   ├── subscription.py # atomic `.txt`/chunk generation
 │   └── health.py       # Railway health-check only
 ├── tests/
 │   └── test_parser.py

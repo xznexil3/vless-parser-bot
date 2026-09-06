@@ -31,8 +31,12 @@ AUTO_DISCOVERY = os.getenv("AUTO_DISCOVERY", "true").strip().lower() not in {
     "off",
 }
 DISCOVERY_MAX_REPOS = max(1, min(int(os.getenv("DISCOVERY_MAX_REPOS", "6")), 12))
-DISCOVERY_MAX_FEEDS = max(1, min(int(os.getenv("DISCOVERY_MAX_FEEDS", "20")), 40))
-DISCOVERY_MIN_VALID = max(1, min(int(os.getenv("DISCOVERY_MIN_VALID", "5")), 100))
+DISCOVERY_MAX_FEEDS = max(1, min(int(os.getenv("DISCOVERY_MAX_FEEDS", "8")), 16))
+DISCOVERY_MIN_VALID = max(1, min(int(os.getenv("DISCOVERY_MIN_VALID", "10")), 100))
+DISCOVERY_MAX_CONFIGS = max(
+    100,
+    min(int(os.getenv("DISCOVERY_MAX_CONFIGS", "1200")), 3000),
+)
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", os.getenv("GH_TOKEN", ""))
 GITHUB_REPO = os.getenv("GITHUB_REPO", "xznexil3/vless-parser-bot")
@@ -51,54 +55,19 @@ def pe(name: str, fallback: str = "") -> str:
     return ""
 
 
-# Provider keys requested for the white-list aggregate. Keep this tuple in the
-# same order as the source list shown to users.
-REQUIRED_PROVIDER_KEYS = (
-    "collection",
-    "zieng2",
-    "etoneya",
-    "igareck",
-    "cid_vpn",
-    "wrtrmmu",
-    "wlrus",
-    "byewhitelists2",
-    "vercel",
-    "ghost_vpn",
-    "vpn_bolt",
-)
-
-# Only VLESS links are extracted from every payload. ``first_available`` means
-# that the URLs are mirrors; ``all`` means that each URL is a distinct feed.
+# Only explicitly selected GitHub feeds and strict GitHub discovery are used.
+# Non-GitHub mirrors and broad collection/index feeds are intentionally excluded.
 SOURCES = {
-    "collection": {
-        "name": "Сборник подписок против БС",
-        "description": "Объединённая WL-подписка",
-        "url_strategy": "first_available",
-        "urls": [
-            "https://codeberg.org/VALCHIK/bypass-rkn-blocks/raw/branch/main/configs/obhod_WL",
-        ],
-    },
     "zieng2": {
-        "name": "zieng2",
-        "description": "Полная VLESS WL-подписка",
+        "name": "zieng2 — GitHub",
+        "description": "VLESS whitelist feed",
         "url_strategy": "first_available",
         "urls": [
             "https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt",
-            "https://codeberg.org/zieng2/wl/raw/branch/main/vless_universal.txt",
-            "https://gitverse.ru/api/repos/zieng2/wl/raw/branch/master/list_universal.txt",
-        ],
-    },
-    "etoneya": {
-        "name": "EtoNeYa",
-        "description": "Подписка для белых списков",
-        "url_strategy": "first_available",
-        "urls": [
-            "https://etoneya.su/whitelist",
-            "https://etoneya.vercel.app/whitelist",
         ],
     },
     "igareck": {
-        "name": "igareck",
+        "name": "igareck — white GitHub",
         "description": "VLESS из белых CIDR",
         "url_strategy": "first_available",
         "urls": [
@@ -107,69 +76,32 @@ SOURCES = {
         ],
     },
     "cid_vpn": {
-        "name": "CID VPN",
-        "description": "Основная и WL-подписки CID VPN",
-        "url_strategy": "all",
+        "name": "CID VPN — GitHub",
+        "description": "Основная VLESS-подписка CID VPN",
+        "url_strategy": "first_available",
         "urls": [
             "https://raw.githubusercontent.com/CidVpn/cid-vpn-config/refs/heads/main/general.txt",
-            "https://gitverse.ru/api/repos/cid-uskoritel/cid-white/raw/branch/master/whitelist.txt",
-        ],
-    },
-    "wrtrmmu": {
-        "name": "wrtrmmu",
-        "description": "Случайная WL-выборка nowmeow",
-        "url_strategy": "first_available",
-        "urls": [
-            "https://nowmeow.pw/8ybBd3fdCAQ6Ew5H0d66Y1hMbh63GpKUtEXQClIu/whitelist",
-        ],
-    },
-    "wlrus": {
-        "name": "wlrus.lol",
-        "description": "Проверенные WL RUS подсети",
-        "url_strategy": "first_available",
-        "urls": [
-            "https://wlrus.lol/confs/wl.txt",
-            "https://gitverse.ru/api/repos/bywarm/rser/raw/branch/master/wl.txt",
-            "https://s3c3.001.gpucloud.ru/wlr/wl.txt",
         ],
     },
     "byewhitelists2": {
-        "name": "ByeWhiteLists 2.0",
+        "name": "ByeWhiteLists 2.0 — GitHub",
         "description": "GoodbyeWL / ByeWhiteLists 2.0",
         "url_strategy": "first_available",
         "urls": [
             "https://raw.githubusercontent.com/ByeWhiteLists/ByeWhiteLists2/refs/heads/main/ByeWhiteLists2.txt",
         ],
     },
-    "vercel": {
-        "name": "Vercel",
-        "description": "white-lists.vercel.app, Россия",
-        "url_strategy": "first_available",
-        "urls": [
-            "https://white-lists.vercel.app/api/filter?code=RU",
-        ],
-    },
     "ghost_vpn": {
-        "name": "Ghost-vpn.ru",
-        "description": "Две WL-подписки Ghost VPN",
+        "name": "Ghost VPN — white GitHub",
+        "description": "White-list VLESS feeds",
         "url_strategy": "all",
         "urls": [
             "https://raw.githubusercontent.com/SilentGhostCodes/WhiteListVpn/refs/heads/main/Whitelist.txt",
             "https://raw.githubusercontent.com/SilentGhostCodes/WhiteListVpn/refs/heads/main/Whitelist%20%E2%84%962.txt",
         ],
     },
-    "vpn_bolt": {
-        "name": "VPN bolt",
-        "description": "VLESS Reality White из russian-white-bolt_fix",
-        "url_strategy": "first_available",
-        "urls": [
-            "https://gitverse.ru/api/repos/RUVIPIEN/russian-white-bolt_fix/raw/branch/master/configs/v2ray/VLESS_Reality_White.txt",
-        ],
-    },
-    # Black-list feeds remain separate so the black aggregate does not mix in
-    # the white-list providers above.
     "igareck_black": {
-        "name": "igareck — black",
+        "name": "igareck — black GitHub",
         "description": "VLESS для обычных блокировок",
         "url_strategy": "all",
         "urls": [
@@ -177,57 +109,51 @@ SOURCES = {
             "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS_mobile.txt",
         ],
     },
-    "etoneya_black": {
-        "name": "EtoNeYa — black",
-        "description": "EtoNeYa для обычных блокировок",
-        "url_strategy": "first_available",
-        "urls": [
-            "https://etoneya.su/other",
-            "https://etoneya.vercel.app/blacklist",
-        ],
-    },
     "ghost_vpn_black": {
-        "name": "Ghost-vpn.ru — black",
-        "description": "Ghost VPN для обычных блокировок",
+        "name": "Ghost VPN — black GitHub",
+        "description": "Black-list VLESS feed",
         "url_strategy": "first_available",
         "urls": [
             "https://raw.githubusercontent.com/SilentGhostCodes/WhiteListVpn/refs/heads/main/BlackList.txt",
         ],
     },
     "aetris_vpn": {
-        "name": "AetrisVPN — black",
+        "name": "AetrisVPN — black GitHub",
         "description": "Автообновляемая VLESS-подписка AetrisVPN",
         "url_strategy": "first_available",
         "urls": [
             "https://raw.githubusercontent.com/flaafix/AetrisVPN-black-list/main/configs.txt",
         ],
     },
-    "internet_discovery": {
-        "name": "Автопоиск VLESS в интернете",
-        "description": "Ограниченный поиск свежих публичных GitHub-подписок",
+    "github_discovery": {
+        "name": "Строгий GitHub-поиск VLESS",
+        "description": "Поиск VLESS/VPN/config/list/blacklist feed-ов",
         "discovery": True,
-        "index_urls": [
-            "https://raw.githubusercontent.com/NiREvil/vless/main/README.md",
-        ],
         "search_queries": [
-            "vless subscription in:name,description,readme stars:>20",
-            "free vless configs in:name,description,readme stars:>10",
+            "vless vpn config blacklist in:name,description,readme stars:>5",
+            "vless vpn config list in:name,description,readme stars:>10",
+            "vless subscription blacklist in:name,description,readme stars:>3",
         ],
         "urls": [],
     },
 }
 if not AUTO_DISCOVERY:
-    SOURCES.pop("internet_discovery", None)
+    SOURCES.pop("github_discovery", None)
 
+WHITE_SOURCE_KEYS = [
+    "zieng2",
+    "igareck",
+    "cid_vpn",
+    "byewhitelists2",
+    "ghost_vpn",
+]
 BLACK_SOURCE_KEYS = [
     "igareck_black",
-    "etoneya_black",
     "ghost_vpn_black",
     "aetris_vpn",
 ]
 if AUTO_DISCOVERY:
-    BLACK_SOURCE_KEYS.append("internet_discovery")
-WHITE_SOURCE_KEYS = list(REQUIRED_PROVIDER_KEYS)
+    BLACK_SOURCE_KEYS.append("github_discovery")
 FULL_SOURCE_KEYS = WHITE_SOURCE_KEYS + BLACK_SOURCE_KEYS
 
 AGGREGATED_SUBS = {
@@ -263,22 +189,28 @@ WELCOME_TEXT = """<b>Free VPN • Crimson</b> — рабочие автообн�
 
 <i>Построй свой суверенитет в сети с помощью Crimson.</i>"""
 
-HELP_TEXT = """<b>Free VPN • Crimson — помощь</b>
+FILE_USAGE_TEXT = """<b>Как использовать файл:</b>
+1. Скачай полученный <code>.txt</code>.
+2. Если VPN-клиент поддерживает импорт из файла — выбери этот файл.
+3. Иначе открой <code>.txt</code>, скопируй нужную строку <code>vless://…</code> и выбери в клиенте «Импорт из буфера обмена».
+4. Проверь несколько конфигураций и оставь ту, которая подключается стабильнее."""
+
+HELP_TEXT = f"""<b>Free VPN • Crimson — помощь</b>
 
 <b>«Профиль»</b> — твой ID
 <b>«Белые списки»</b> — для ТСПУ
 <b>«Черные списки»</b> — весь трафик через VPN
 <b>«Полный список»</b> — все вместе
 
-<b>Как подключить:</b>
-1. Выбери список → скопируй ссылку
-2. Вставь в Happ / Streisand / v2rayNG
-3. Обнови → подключись
+Бот отправляет только готовые <code>.txt</code>-файлы, без ссылок на подписки.
 
+{FILE_USAGE_TEXT}
+
+Подходящие клиенты: Happ, Hiddify, Streisand, v2rayNG и NekoRay.
 Вопросы — @unnervin"""
 
 SOURCES_TEXT = """<b>Источники VLESS</b>
 
-Сборник подписок против БС, zieng2, EtoNeYa, igareck, CID VPN, wrtrmmu, wlrus.lol, ByeWhiteLists 2.0, Vercel, Ghost-vpn.ru, VPN bolt, AetrisVPN и автоматический поиск свежих GitHub-подписок.
+Используются только GitHub feed-ы: zieng2, igareck, CID VPN, ByeWhiteLists 2.0, Ghost VPN, AetrisVPN и строгий GitHub-поиск.
 
-При каждом обновлении бот заново загружает интернет-источники. Из payload извлекаются только корректные <b>VLESS</b>; зеркала используются как fallback, дубликаты удаляются."""
+Поиск учитывает слова VLESS, VPN, config, list и blacklist. Широкие collection/index-источники отключены. Из файлов принимаются только корректные <b>VLESS</b>; дубликаты удаляются."""

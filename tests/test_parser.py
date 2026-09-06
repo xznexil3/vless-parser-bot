@@ -151,22 +151,21 @@ class ExtractionTests(unittest.TestCase):
         second = vless(query="encryption=none&security=tls&type=ws", fragment="two")
         self.assertEqual(parser.deduplicate_configs([first, second, first]), [first])
 
-    def test_discovery_extracts_only_likely_github_feed_urls(self):
-        vless_feed = "https://raw.githubusercontent.com/owner/repo/main/vless.txt"
-        config_page = "https://github.com/owner/repo/raw/main/configs.txt"
-        config_feed = "https://raw.githubusercontent.com/owner/repo/main/configs.txt"
-        payload = "\n".join(
-            [
-                vless_feed,
-                config_page,
-                "https://raw.githubusercontent.com/owner/repo/main/README.md",
-                "https://example.com/vless.txt",
-                "https://raw.githubusercontent.com/owner/repo/main/logo.png",
-            ]
+    def test_discovery_requires_strict_github_vless_filters(self):
+        accepted = (
+            "https://raw.githubusercontent.com/owner/vpn-list/"
+            "main/blacklist_vless_config.txt"
         )
-        self.assertEqual(
-            parser.extract_discovery_urls(payload),
-            [vless_feed, config_feed],
+        self.assertGreater(parser._discovery_url_score(accepted), 0)
+        self.assertLess(
+            parser._discovery_url_score(
+                "https://raw.githubusercontent.com/owner/repo/main/configs.txt"
+            ),
+            0,
+        )
+        self.assertLess(
+            parser._discovery_url_score("https://example.com/vless_config.txt"),
+            0,
         )
 
 
@@ -259,7 +258,7 @@ class AsyncValidationTests(unittest.IsolatedAsyncioTestCase):
         second_url = "https://raw.githubusercontent.com/new/feed/main/empty.txt"
         links = [
             vless(host=f"node{index}.example.com", port=4000 + index, fragment=str(index))
-            for index in range(1, 7)
+            for index in range(1, 13)
         ]
 
         async def fake_fetch(_session, url):
@@ -267,20 +266,21 @@ class AsyncValidationTests(unittest.IsolatedAsyncioTestCase):
                 return "\n".join([*links, "vmess://ignored"])
             return "not a subscription"
 
-        source = {"name": "discovery", "description": "test", "index_urls": []}
+        source = {"name": "discovery", "description": "test"}
         with patch.object(
             parser,
             "discover_github_feed_urls",
             AsyncMock(return_value=([first_url, second_url], [])),
         ):
             with patch.object(parser, "fetch_text", AsyncMock(side_effect=fake_fetch)):
-                result = await parser.fetch_discovered_category(
-                    None,
-                    "internet_discovery",
-                    source,
-                    "syntax",
-                )
-        self.assertEqual(result["configs"], links)
+                with patch.object(parser, "DISCOVERY_MAX_CONFIGS", 7):
+                    result = await parser.fetch_discovered_category(
+                        None,
+                        "github_discovery",
+                        source,
+                        "syntax",
+                    )
+        self.assertEqual(result["configs"], links[:7])
         self.assertEqual(result["used_urls"], [first_url])
         self.assertEqual(result["raw_total"], len(links))
 
@@ -455,20 +455,19 @@ class SubscriptionTests(unittest.TestCase):
                 patch.object(bot, "AGGREGATED_CHUNKS", {}),
                 patch.object(bot, "AGGREGATED_PROTO_COUNTS", {}),
             ):
-                raw_url = (
-                    "https://raw.githubusercontent.com/owner/repo/"
-                    "main/BLACK_FULL_1.txt"
-                )
                 bot.activate_aggregated_configs(
                     results,
                     chunk_map,
                     {"BLACK_FULL.txt": {"vless": 1}},
-                    {"BLACK_FULL_1.txt": raw_url},
                 )
                 self.assertEqual(bot.AGGREGATED_CHUNKS, chunk_map)
                 self.assertEqual(
-                    bot.AGGREGATED_CACHE["BLACK_FULL_1.txt"]["raw_url"],
-                    raw_url,
+                    bot.AGGREGATED_CACHE["BLACK_FULL_1.txt"]["count"],
+                    1,
+                )
+                self.assertNotIn(
+                    "raw_url",
+                    bot.AGGREGATED_CACHE["BLACK_FULL_1.txt"],
                 )
                 self.assertFalse(stale.exists())
 
@@ -482,18 +481,27 @@ class SubscriptionTests(unittest.TestCase):
 
 
 class SourceRegistryTests(unittest.TestCase):
-    def test_all_requested_providers_are_registered_and_aggregated(self):
-        self.assertEqual(len(config.REQUIRED_PROVIDER_KEYS), 11)
-        self.assertTrue(set(config.REQUIRED_PROVIDER_KEYS).issubset(config.SOURCES))
-        self.assertTrue(
-            set(config.REQUIRED_PROVIDER_KEYS).issubset(
-                config.AGGREGATED_SUBS["WHITE_FULL"]["source_keys"]
-            )
+    def test_only_selected_github_sources_are_registered(self):
+        self.assertNotIn("collection", config.SOURCES)
+        self.assertNotIn("internet_discovery", config.SOURCES)
+        self.assertEqual(
+            set(config.WHITE_SOURCE_KEYS),
+            {"zieng2", "igareck", "cid_vpn", "byewhitelists2", "ghost_vpn"},
         )
-        self.assertTrue(
-            set(config.REQUIRED_PROVIDER_KEYS).issubset(
-                config.AGGREGATED_SUBS["FULL"]["source_keys"]
-            )
+        for key, source in config.SOURCES.items():
+            if source.get("discovery"):
+                continue
+            with self.subTest(source=key):
+                self.assertTrue(source["urls"])
+                self.assertTrue(
+                    all(
+                        url.startswith("https://raw.githubusercontent.com/")
+                        for url in source["urls"]
+                    )
+                )
+        self.assertEqual(
+            set(config.FULL_SOURCE_KEYS),
+            set(config.WHITE_SOURCE_KEYS) | set(config.BLACK_SOURCE_KEYS),
         )
 
     def test_aetris_is_fetched_into_black_and_full_aggregates(self):
@@ -506,14 +514,13 @@ class SourceRegistryTests(unittest.TestCase):
         self.assertIn("aetris_vpn", config.AGGREGATED_SUBS["FULL"]["source_keys"])
         self.assertNotIn("aetris_vpn", config.AGGREGATED_SUBS["WHITE_FULL"]["source_keys"])
 
-    def test_bounded_internet_discovery_is_enabled_in_black_and_full(self):
+    def test_strict_github_discovery_is_enabled_and_bounded(self):
         self.assertTrue(config.AUTO_DISCOVERY)
-        self.assertTrue(config.SOURCES["internet_discovery"]["discovery"])
-        self.assertIn("internet_discovery", config.BLACK_SOURCE_KEYS)
-        self.assertIn(
-            "internet_discovery",
-            config.AGGREGATED_SUBS["FULL"]["source_keys"],
-        )
+        self.assertTrue(config.SOURCES["github_discovery"]["discovery"])
+        self.assertIn("github_discovery", config.BLACK_SOURCE_KEYS)
+        self.assertIn("github_discovery", config.FULL_SOURCE_KEYS)
+        self.assertLessEqual(config.DISCOVERY_MAX_FEEDS, 16)
+        self.assertLessEqual(config.DISCOVERY_MAX_CONFIGS, 3000)
 
     def test_admin_label_is_exact(self):
         bot_source = (ROOT / "src" / "bot.py").read_text(encoding="utf-8")
@@ -537,25 +544,14 @@ class SourceRegistryTests(unittest.TestCase):
         self.assertEqual(back.text, "«Назад»")
         self.assertEqual(back.style, KeyboardButtonStyle.PRIMARY)
 
-    def test_only_published_github_txt_url_is_returned(self):
-        raw_url = (
-            "https://raw.githubusercontent.com/xznexil3/vless-parser-bot/"
-            "main/BLACK_FULL_6.txt"
-        )
-        with patch.object(
-            bot,
-            "AGGREGATED_CACHE",
-            {"BLACK_FULL_6.txt": {"raw_url": raw_url}},
-        ):
-            self.assertEqual(bot.get_raw_url("BLACK_FULL_6.txt"), raw_url)
-
-    def test_unpublished_chunk_does_not_get_an_invented_github_url(self):
-        with patch.object(
-            bot,
-            "AGGREGATED_CACHE",
-            {"BLACK_FULL_6.txt": {"raw_url": ""}},
-        ):
-            self.assertEqual(bot.get_raw_url("BLACK_FULL_6.txt"), "")
+    def test_interface_offers_files_without_subscription_links(self):
+        bot_source = (ROOT / "src" / "bot.py").read_text(encoding="utf-8")
+        self.assertNotIn("get_raw_url", bot_source)
+        self.assertNotIn("«Копировать", bot_source)
+        self.assertNotIn("generate_qr_bytes", bot_source)
+        self.assertIn("«Скачать .txt»", bot_source)
+        self.assertIn("config.FILE_USAGE_TEXT", bot_source)
+        self.assertIn(config.FILE_USAGE_TEXT, config.HELP_TEXT)
 
     def test_obsolete_chunk_callback_resolves_to_current_aggregate(self):
         key, aggregate = bot.aggregate_for_filename("BLACK_FULL_6.txt")
