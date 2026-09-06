@@ -12,7 +12,10 @@ if _extra_admins:
         try:
             ADMIN_IDS.add(int(x.strip()))
         except: pass
-CHANNEL_ID = os.getenv("CHANNEL_ID", "")
+CHANNEL_ID = os.getenv("CHANNEL_ID", "@vpncrimson")
+REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "@vpncrimson")
+CHANNEL_USERNAME = "@vpncrimson"
+CHANNEL_LINK = "https://t.me/vpncrimson"
 CHECK_MODE = os.getenv("CHECK_MODE", "syntax")
 UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", "30"))
 PUBLIC_URL = os.getenv("PUBLIC_URL", "")

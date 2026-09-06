@@ -3,6 +3,7 @@ import asyncio
 import logging
 import random
 import base64
+import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -31,10 +32,48 @@ LAST_UPDATE = None
 AGGREGATED_CACHE = {}
 AGGREGATED_CHUNKS = {}
 AGGREGATED_PROTO_COUNTS = {}
+TEMP_FILES = {}  # filename -> {user_id, created_at, expires_at}
+USERS_FILE = DATA_DIR / "users.json"
 
 MSK = timezone(timedelta(hours=3))
 
 REPLY_MENU = ReplyKeyboardMarkup([[KeyboardButton("Главное меню")]], resize_keyboard=True, is_persistent=True)
+
+# ---------- Users (для даты регистрации) ----------
+
+def load_users():
+    try:
+        if USERS_FILE.exists():
+            return json.loads(USERS_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.error(f"load users failed: {e}")
+    return {}
+
+def save_users(users):
+    try:
+        USERS_FILE.write_text(json.dumps(users, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.error(f"save users failed: {e}")
+
+def get_or_create_user(user_id: int, username: str = "", first_name: str = ""):
+    users = load_users()
+    uid_str = str(user_id)
+    if uid_str not in users:
+        users[uid_str] = {
+            "username": username or "",
+            "first_name": first_name or "",
+            "registration_date": datetime.now(MSK).strftime("%d.%m.%Y"),
+            "first_seen": datetime.now(MSK).isoformat()
+        }
+        save_users(users)
+    else:
+        # обновляем username если изменился
+        if username and users[uid_str].get("username") != username:
+            users[uid_str]["username"] = username
+            save_users(users)
+    return users[uid_str]
+
+# ---------- Keyboards ----------
 
 def main_keyboard(user_id: int = None):
     kb = [
@@ -58,6 +97,12 @@ def admin_keyboard():
         [InlineKeyboardButton("«Назад»", callback_data="home")],
     ])
 
+def sub_required_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("«Подписаться на канал»", url=config.CHANNEL_LINK)],
+        [InlineKeyboardButton("«Проверить подписку»", callback_data="check_sub")]
+    ])
+
 def chunks_keyboard(base_filename: str, chunk_list, back_data: str = "home", back_label: str = "«Назад»"):
     rows = []
     for _, (cfname, _, cnt) in enumerate(chunk_list, 1):
@@ -77,11 +122,29 @@ def protocol_keyboard(agg_key: str):
         return InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]])
     base = agg["filename"]
     total = AGGREGATED_CACHE.get(base, {}).get("count", "?")
-    # Так как теперь только VLESS, показываем только его
     rows = []
     rows.append([InlineKeyboardButton(f"«VLESS · {total}»", callback_data=f"proto:{agg_key}:all")])
     rows.append([InlineKeyboardButton("«Назад»", callback_data="home")])
     return InlineKeyboardMarkup(rows)
+
+# ---------- Channel subscription check ----------
+
+async def is_user_subscribed(user_id: int, bot) -> bool:
+    """Проверяет подписку на @vpncrimson"""
+    try:
+        chat_id = config.REQUIRED_CHANNEL
+        member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        return member.status in ['member', 'administrator', 'creator', 'owner']
+    except Exception as e:
+        # Если бот не админ в канале или канал приватный — не блокируем, но логируем
+        err_str = str(e).lower()
+        if "not enough rights" in err_str or "chat not found" in err_str or "forbidden" in err_str:
+            logger.warning(f"Cannot check subscription for {user_id}: {e} — allowing")
+            return True
+        logger.warning(f"Sub check failed for {user_id}: {e}")
+        return True
+
+# ---------- Aggregated ----------
 
 def build_aggregated_configs():
     results = {}
@@ -102,7 +165,6 @@ def build_aggregated_configs():
         for sk in source_keys:
             data = CACHE.get(sk, {})
             for c in data.get("configs", []):
-                # Только VLESS
                 if not c.lower().startswith("vless://"):
                     continue
                 if c not in seen:
@@ -144,14 +206,32 @@ async def push_aggregated_to_github(aggregated_results):
         logger.error(f"push error: {e}")
         return {}
 
-async def update_cache(categories=None, mode=None):
+async def notify_channel_update(bot, old_total, new_total):
+    """Уведомление в канал @vpncrimson об обновлении списков"""
+    if not config.CHANNEL_ID:
+        return
+    try:
+        diff = new_total - old_total
+        sign = f"+{diff}" if diff > 0 else str(diff)
+        text = (
+            f"<b>Free VPN • Crimson — списки обновлены</b>\n\n"
+            f"Всего VLESS: <b>{new_total}</b> ({sign})\n"
+            f"Дата: {datetime.now(MSK).strftime('%d.%m.%Y %H:%M МСК')}\n\n"
+            f"Получить — @wtfparsbot"
+        )
+        await bot.send_message(chat_id=config.CHANNEL_ID, text=text, parse_mode=ParseMode.HTML)
+        logger.info(f"Notified channel {config.CHANNEL_ID} about update")
+    except Exception as e:
+        logger.warning(f"Channel notify failed: {e}")
+
+async def update_cache(categories=None, mode=None, bot=None):
     global CACHE, LAST_UPDATE
     mode = mode or config.CHECK_MODE
     if categories is None:
         categories = list(config.SOURCES.keys())
+    old_total = sum(len(v.get("configs", [])) for v in CACHE.values()) if CACHE else 0
     result = await fetch_all(mode=mode, categories=categories)
     for key, data in result.items():
-        # Фильтруем только VLESS
         filtered = [c for c in data.get("configs", []) if c.lower().startswith("vless://")]
         data["configs"] = filtered
         title = config.SOURCES.get(key, {}).get("name", key)
@@ -162,6 +242,7 @@ async def update_cache(categories=None, mode=None):
                 logger.error(f"save error {key}: {e}")
         CACHE[key] = data
     LAST_UPDATE = datetime.now(MSK)
+    new_total = sum(len(v.get("configs", [])) for v in CACHE.values())
     try:
         agg = build_aggregated_configs()
         for fname, info in agg.items():
@@ -171,6 +252,9 @@ async def update_cache(categories=None, mode=None):
                 AGGREGATED_CACHE[fname].update({"count": info["count"], "content": info["content"]})
         if config.GITHUB_TOKEN and agg:
             asyncio.create_task(push_aggregated_to_github(agg))
+        # Уведомление в канал если есть изменения
+        if bot and old_total != new_total and abs(new_total - old_total) > 5:
+            asyncio.create_task(notify_channel_update(bot, old_total, new_total))
     except Exception as e:
         logger.error(f"aggregated error: {e}")
     return result
@@ -191,24 +275,29 @@ def get_public_url(filename: str) -> str:
         return f"{base}/sub/{filename}"
     return ""
 
+def get_temp_raw_url(filename: str) -> str:
+    """Временный .txt на самом репо vless-parser-bot (без доменов)"""
+    # Используем основной репо бота для временных файлов
+    repo = "xznexil3/vless-parser-bot"
+    branch = "main"
+    return f"https://raw.githubusercontent.com/{repo}/{branch}/{filename}"
+
 # ---------- Media helpers — редактируем одно сообщение ----------
 
 def get_banner_path(name: str) -> Path:
     return ASSETS_DIR / f"banner_{name}.png"
 
 async def edit_message_with_banner(query, banner_name: str, text: str, reply_markup):
-    """Редактирует существующее сообщение (фото или текст) — не создает новых, чтобы не засорять чат"""
+    """Редактирует существующее сообщение — не создает новых"""
     banner_path = get_banner_path(banner_name)
     try:
         if banner_path.exists():
-            # Если сообщение уже с фото — редактируем медиа
             if query.message.photo:
                 with open(banner_path, 'rb') as f:
                     media = InputMediaPhoto(media=f, caption=text, parse_mode=ParseMode.HTML)
                     await query.message.edit_media(media=media, reply_markup=reply_markup)
                     return
             else:
-                # Пытаемся отредактировать текстовое сообщение в медиа (работает в новых версиях)
                 try:
                     with open(banner_path, 'rb') as f:
                         media = InputMediaPhoto(media=f, caption=text, parse_mode=ParseMode.HTML)
@@ -216,20 +305,17 @@ async def edit_message_with_banner(query, banner_name: str, text: str, reply_mar
                         return
                 except Exception:
                     pass
-                # Если не получилось — пробуем caption
                 try:
                     await query.message.edit_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
                     return
                 except Exception:
                     pass
-                # Fallback — edit_text
                 try:
                     await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
                     return
                 except Exception:
                     pass
         else:
-            # Без баннера
             try:
                 await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
                 return
@@ -241,8 +327,6 @@ async def edit_message_with_banner(query, banner_name: str, text: str, reply_mar
                     pass
     except Exception as e:
         logger.error(f"edit with banner {banner_name} failed: {e}")
-
-    # Последний fallback — пробуем хоть что-то
     try:
         await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
     except:
@@ -266,20 +350,91 @@ async def send_initial_banner(update: Update, banner_name: str, text: str, reply
             logger.error(f"send banner {banner_name} failed: {e}")
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
 
+# ---------- Temp files (3 часа) ----------
+
+async def delete_temp_file_from_github(filename: str):
+    """Удаляет временный файл из репо через GitHub API"""
+    try:
+        import aiohttp, base64
+        token = config.GITHUB_TOKEN
+        if not token:
+            return
+        repo = "xznexil3/vless-parser-bot"
+        # Получаем sha
+        async with aiohttp.ClientSession() as session:
+            url = f"https://api.github.com/repos/{repo}/contents/{filename}"
+            headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    return
+                data = await resp.json()
+                sha = data.get("sha")
+            if not sha:
+                return
+            payload = {"message": f"delete temp {filename} after 3h", "sha": sha, "branch": "main"}
+            async with session.delete(url, headers=headers, json=payload) as resp:
+                txt = await resp.text()
+                if resp.status in (200, 204):
+                    logger.info(f"Deleted temp file {filename} from GitHub")
+                else:
+                    logger.warning(f"Delete temp {filename} failed {resp.status}: {txt[:200]}")
+    except Exception as e:
+        logger.error(f"delete temp file error {filename}: {e}")
+
+async def schedule_temp_deletion(filename: str, delay_seconds: int = 10800):
+    """Удаляет файл через 3 часа"""
+    await asyncio.sleep(delay_seconds)
+    # Удаляем локально
+    try:
+        local_path = Path(__file__).parent.parent / filename
+        if local_path.exists():
+            local_path.unlink()
+            logger.info(f"Deleted local temp {filename}")
+        data_path = DATA_DIR / filename
+        if data_path.exists():
+            data_path.unlink()
+        b64_path = DATA_DIR / filename.replace(".txt", "_base64.txt")
+        if b64_path.exists():
+            b64_path.unlink()
+    except Exception as e:
+        logger.error(f"local delete temp failed {filename}: {e}")
+    # Удаляем из GitHub
+    await delete_temp_file_from_github(filename)
+    TEMP_FILES.pop(filename, None)
+
 # ---------- Handlers ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else None
+    user = update.effective_user
+    get_or_create_user(uid, user.username if user else "", user.first_name if user else "")
+
+    # Проверка подписки на канал
+    if not await is_user_subscribed(uid, context.bot):
+        text = (
+            f"<b>Доступ только по подписке</b>\n\n"
+            f"Подпишись на канал {config.CHANNEL_USERNAME}, чтобы пользоваться ботом\n\n"
+            f"После подписки нажми «Проверить подписку»"
+        )
+        await send_initial_banner(update, "main", text, sub_required_keyboard())
+        return
+
     await update.message.reply_text("Клавиатура обновлена — жми «Главное меню» внизу", reply_markup=REPLY_MENU)
     await send_initial_banner(update, "main", config.WELCOME_TEXT, main_keyboard(uid))
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else None
+    if not await is_user_subscribed(uid, context.bot):
+        await update.message.reply_text(f"Подпишись на {config.CHANNEL_USERNAME} чтобы продолжить", reply_markup=sub_required_keyboard())
+        return
     await send_initial_banner(update, "help", config.HELP_TEXT, main_keyboard(uid))
 
 async def handle_main_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "Главное меню":
         uid = update.effective_user.id if update.effective_user else None
+        if not await is_user_subscribed(uid, context.bot):
+            await update.message.reply_text(f"Подпишись на {config.CHANNEL_USERNAME}", reply_markup=sub_required_keyboard())
+            return True
         await send_initial_banner(update, "main", config.WELCOME_TEXT, main_keyboard(uid))
         return True
     return False
@@ -287,8 +442,13 @@ async def handle_main_menu_text(update: Update, context: ContextTypes.DEFAULT_TY
 async def send_chunk_file(query, fname, back_data="home"):
     path = DATA_DIR / fname
     if not path.exists():
-        await query.message.reply_text("Файл не найден, обновляю…")
-        await update_cache()
+        # Проверяем в корне репо (временные файлы)
+        root_path = Path(__file__).parent.parent / fname
+        if root_path.exists():
+            path = root_path
+        else:
+            await query.message.reply_text("Файл не найден, обновляю…")
+            await update_cache(bot=query.get_bot() if hasattr(query, 'get_bot') else None)
     if path.exists():
         title = fname
         for v in config.AGGREGATED_SUBS.values():
@@ -299,13 +459,16 @@ async def send_chunk_file(query, fname, back_data="home"):
                 title = f"{v['profile_title']} — {fname}"
                 break
         cnt = AGGREGATED_CACHE.get(fname, {}).get("count", "?")
-        raw = get_public_url(fname) or get_raw_url(fname)
-        text = f"<b>{title}</b>\n<code>{raw}</code>\n\nКонфигов: <b>{cnt}</b>"
+        # Для временных файлов используем прямую ссылку на репо
+        if fname.startswith("TEMP_") or fname.startswith("CUSTOM_100_"):
+            raw = get_temp_raw_url(fname)
+        else:
+            raw = get_public_url(fname) or get_raw_url(fname)
+        text = f"<b>{title}</b>\n\n<code>{raw}</code>\n\nКонфигов: <b>{cnt}</b>"
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("«Скачать файл»", callback_data=f"rawfile:{fname}"), InlineKeyboardButton("«Копировать ссылку»", callback_data=f"rawcopy:{fname}")],
             [InlineKeyboardButton("«Назад»", callback_data=back_data)]
         ])
-        # Чанки — это конфигурации (баннер configs)
         await edit_message_with_banner(query, "configs", text, kb)
         try:
             await query.message.reply_document(document=open(path, "rb"), filename=fname, caption=f"{title} • {cnt}")
@@ -313,7 +476,6 @@ async def send_chunk_file(query, fname, back_data="home"):
             logger.error(e)
 
 async def handle_build_subscription(query, user_id):
-    # Фикс: редактируем текущее сообщение, а не пытаемся edit_text на фото
     try:
         await query.message.edit_caption(caption="Собираю подписку из 100 VLESS, подожди 5 сек...", parse_mode=ParseMode.HTML)
     except:
@@ -323,7 +485,7 @@ async def handle_build_subscription(query, user_id):
             pass
 
     if not CACHE:
-        await update_cache()
+        await update_cache(bot=query.get_bot() if hasattr(query, 'get_bot') else None)
 
     all_configs = []
     seen = set()
@@ -348,52 +510,61 @@ async def handle_build_subscription(query, user_id):
     random.shuffle(valid_configs)
     selected = valid_configs[:100] if len(valid_configs) >= 100 else valid_configs
     title = "Free VPN • Crimson — Custom 100"
-    filename = f"CUSTOM_100_{user_id}.txt"
+    # Временный .txt на самом репо, живет 3 часа
+    timestamp = datetime.now(MSK).strftime("%H%M")
+    filename = f"TEMP_100_{user_id}_{timestamp}.txt"
 
     try:
-        path, b64_path, content, b64_content = save_aggregated_file(str(DATA_DIR), filename, title, selected)
-        raw_url = None
-        public_url = get_public_url(filename)
+        # Сохраняем в data и в корень репо для пуша
+        path_data, _, content, _ = save_aggregated_file(str(DATA_DIR), filename, title, selected)
+        root_path = Path(__file__).parent.parent / filename
+        root_path.write_text(content, encoding="utf-8")
 
-        if config.GITHUB_TOKEN and config.GITHUB_REPO:
+        # Пушим в основной репо vless-parser-bot (без доменов, просто raw github)
+        raw_url = None
+        if config.GITHUB_TOKEN:
             try:
                 from github_sync import push_aggregated_subscriptions
-                p = f"{config.GITHUB_SUB_PATH}/{filename}" if config.GITHUB_SUB_PATH else filename
-                p = p.lstrip("/")
-                raw_map = await push_aggregated_subscriptions({p: content}, config.GITHUB_REPO, config.GITHUB_TOKEN, config.GITHUB_BRANCH)
-                raw_url = raw_map.get(p)
-                if raw_url:
-                    await asyncio.sleep(1)
+                # Пушим именно в vless-parser-bot для временных файлов
+                temp_repo = "xznexil3/vless-parser-bot"
+                raw_map = await push_aggregated_subscriptions({filename: content}, temp_repo, config.GITHUB_TOKEN, "main")
+                raw_url = raw_map.get(filename) or get_temp_raw_url(filename)
+                # Если пуш успешен, raw_url уже будет
+                if not raw_url:
+                    raw_url = get_temp_raw_url(filename)
             except Exception as e:
-                logger.error(f"push custom failed: {e}")
+                logger.error(f"push temp failed: {e}")
+                raw_url = get_temp_raw_url(filename)
+        else:
+            raw_url = get_temp_raw_url(filename)
 
-        primary_link = public_url or raw_url
-        link_text = f"<code>{primary_link}</code>" if primary_link else "Файл готов — скачай ниже"
+        # Сохраняем инфу о временном файле и планируем удаление через 3 часа
+        TEMP_FILES[filename] = {
+            "user_id": user_id,
+            "created_at": datetime.now(MSK).isoformat(),
+            "expires_at": (datetime.now(MSK) + timedelta(hours=3)).isoformat()
+        }
+        asyncio.create_task(schedule_temp_deletion(filename, 10800))
 
-        AGGREGATED_CACHE[filename] = {"count": len(selected), "content": content, "raw_url": raw_url or primary_link or get_raw_url(filename)}
+        AGGREGATED_CACHE[filename] = {"count": len(selected), "content": content, "raw_url": raw_url}
 
         text = (
             f"<b>Готово — {len(selected)} VLESS</b>\n\n"
-            f"{link_text}\n\n"
-            f"Файл: <code>{filename}</code>"
+            f"<code>{raw_url}</code>\n\n"
+            f"Файл: <code>{filename}</code>\n"
+            f"<i>Живет 3 часа, потом удалится</i>"
         )
 
-        kb_rows = []
-        if primary_link:
-            kb_rows.append([InlineKeyboardButton("«Скопировать ссылку»", callback_data=f"rawcopy:{filename}")])
-        kb_rows.append([
-            InlineKeyboardButton("«Скачать файл»", callback_data=f"rawfile:{filename}"),
-            InlineKeyboardButton("«QR»", callback_data=f"qrfile:{filename}")
-        ])
-        kb_rows.append([
-            InlineKeyboardButton("«Собрать еще раз»", callback_data="build_subscription"),
-            InlineKeyboardButton("«Назад»", callback_data="home")
-        ])
+        kb_rows = [
+            [InlineKeyboardButton("«Скопировать ссылку»", callback_data=f"rawcopy:{filename}")],
+            [InlineKeyboardButton("«Скачать файл»", callback_data=f"rawfile:{filename}"), InlineKeyboardButton("«QR»", callback_data=f"qrfile:{filename}")],
+            [InlineKeyboardButton("«Собрать еще раз»", callback_data="build_subscription"), InlineKeyboardButton("«Назад»", callback_data="home")]
+        ]
 
         await edit_message_with_banner(query, "configs", text, InlineKeyboardMarkup(kb_rows))
 
         try:
-            await query.message.reply_document(document=open(path, "rb"), filename=filename, caption=f"Custom 100 • {len(selected)} VLESS")
+            await query.message.reply_document(document=open(path_data, "rb"), filename=filename, caption=f"Custom 100 • {len(selected)} VLESS • живет 3ч")
         except Exception as e:
             logger.error(e)
 
@@ -417,7 +588,6 @@ async def handle_admin_clean(query):
         configs = data.get("configs", [])
         total_before += len(configs)
         valid = [c for c in configs if c.lower().startswith("vless://")]
-        # валидация
         checked = []
         for c in valid:
             ok, _ = is_valid_any(c)
@@ -458,14 +628,43 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     uid = query.from_user.id if query.from_user else 0
+    user = query.from_user
+
+    # Сохраняем пользователя для даты регистрации
+    if user:
+        get_or_create_user(uid, user.username or "", user.first_name or "")
+
+    # Проверка подписки на канал (кроме кнопки проверки)
+    if data != "check_sub":
+        if not await is_user_subscribed(uid, context.bot):
+            await edit_message_with_banner(query, "main",
+                f"<b>Доступ только по подписке</b>\n\nПодпишись на {config.CHANNEL_USERNAME}, чтобы пользоваться ботом",
+                sub_required_keyboard())
+            return
+
+    if data == "check_sub":
+        if await is_user_subscribed(uid, context.bot):
+            await edit_message_with_banner(query, "main", config.WELCOME_TEXT, main_keyboard(uid))
+        else:
+            await query.answer("Ты еще не подписался на канал", show_alert=True)
+            await edit_message_with_banner(query, "main",
+                f"<b>Ты еще не подписался</b>\n\nПодпишись на {config.CHANNEL_USERNAME} и нажми проверку",
+                sub_required_keyboard())
+        return
 
     if data == "home":
         await edit_message_with_banner(query, "main", config.WELCOME_TEXT, main_keyboard(uid))
         return
 
     if data == "profile":
-        user = query.from_user
-        text = f"<b>Профиль</b>\n\nID: <code>{user.id}</code>\n@{user.username or '—'}\n{user.first_name or '—'}"
+        u = get_or_create_user(uid, user.username if user else "", user.first_name if user else "")
+        text = (
+            f"<b>Профиль</b>\n\n"
+            f"<b>Id</b>\n<code>{uid}</code>\n\n"
+            f"<b>Username</b>\n@{user.username or u.get('username') or '—'}\n\n"
+            f"<b>Name</b>\n{user.first_name or u.get('first_name') or '—'}\n\n"
+            f"<b>Дата регистрации</b>\n{u.get('registration_date', '—')}"
+        )
         await edit_message_with_banner(query, "profile", text, InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
         return
 
@@ -481,7 +680,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not config.is_admin(uid):
             await query.answer("Только для админа", show_alert=True)
             return
-        # Админ панель — тоже через баннер, чтобы не ломалась на фото
         await edit_message_with_banner(query, "main", "<b>Админ панель</b>\n\nВыбери действие:", admin_keyboard())
         return
 
@@ -494,7 +692,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if data == "admin_stats":
             if not CACHE:
-                await update_cache()
+                await update_cache(bot=context.bot)
             lines = [f"<b>Статистика</b>"]
             total=0
             for k,d in CACHE.items():
@@ -508,8 +706,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.edit_caption(caption="Обновляю кэш…", parse_mode=ParseMode.HTML)
             except:
                 await query.message.edit_text("Обновляю кэш…")
-            await update_cache()
-            await edit_message_with_banner(query, "main", f"Готово • {datetime.now(MSK).strftime('%H:%M')}", admin_keyboard())
+            await update_cache(bot=context.bot)
+            await edit_message_with_banner(query, "main", f"<b>Готово</b>\n\nОбновлено {datetime.now(MSK).strftime('%H:%M')}", admin_keyboard())
             return
         if data == "admin_clean":
             await handle_admin_clean(query)
@@ -520,10 +718,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         agg = config.AGGREGATED_SUBS[agg_key]
         base = agg["filename"]
         if base not in AGGREGATED_PROTO_COUNTS:
-            await update_cache()
+            await update_cache(bot=context.bot)
         total = AGGREGATED_CACHE.get(base, {}).get("count", "?")
         text = f"<b>Белые списки</b>\n\nВсего VLESS: <b>{total}</b>\n\nВыбери действие:"
-        # Поменяли местами: белые/черные теперь показывают баннер протоколов
         await edit_message_with_banner(query, "protocols", text, protocol_keyboard(agg_key))
         return
 
@@ -532,7 +729,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         agg = config.AGGREGATED_SUBS[agg_key]
         base = agg["filename"]
         if base not in AGGREGATED_PROTO_COUNTS:
-            await update_cache()
+            await update_cache(bot=context.bot)
         total = AGGREGATED_CACHE.get(base, {}).get("count", "?")
         text = f"<b>Черные списки</b>\n\nВсего VLESS: <b>{total}</b>\n\nВыбери действие:"
         await edit_message_with_banner(query, "protocols", text, protocol_keyboard(agg_key))
@@ -543,7 +740,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         agg = config.AGGREGATED_SUBS[agg_key]
         base = agg["filename"]
         if base not in AGGREGATED_PROTO_COUNTS:
-            await update_cache()
+            await update_cache(bot=context.bot)
         total = AGGREGATED_CACHE.get(base, {}).get("count", "?")
         text = f"<b>Полный список</b>\n\nВсего VLESS: <b>{total}</b>\n\nВыбери действие:"
         await edit_message_with_banner(query, "protocols", text, protocol_keyboard(agg_key))
@@ -561,15 +758,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         base = agg["filename"]
         base_title = agg["profile_title"]
-        fname = base  # теперь только VLESS, all = base
-        display_title = base_title
+        fname = base
         chunks = AGGREGATED_CHUNKS.get(fname, [])
         cnt = AGGREGATED_CACHE.get(fname, {}).get("count", "?")
         raw = get_public_url(fname) or get_raw_url(fname)
         back_target = agg_key.lower().replace("_full","")
         if back_target not in ("white","black","full"):
             back_target = "home"
-        text = f"<b>{display_title}</b>\n\n<code>{raw}</code>\n\nКонфигов: <b>{cnt}</b>\n\nВыбери пакет:"
+        text = f"<b>{base_title}</b>\n\n<code>{raw}</code>\n\nКонфигов: <b>{cnt}</b>\n\nВыбери пакет:"
         if chunks:
             kb = chunks_keyboard(fname, chunks, back_data=back_target, back_label="«К протоколам»")
         else:
@@ -577,8 +773,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("«Скачать файл»", callback_data=f"rawfile:{fname}"), InlineKeyboardButton("«Копировать»", callback_data=f"rawcopy:{fname}")],
                 [InlineKeyboardButton("«К протоколам»", callback_data=back_target)]
             ])
-            text = f"<b>{display_title}</b>\n\n<code>{raw}</code>\n\nКонфигов: <b>{cnt}</b>"
-        # Поменяли местами: выбор пакета теперь баннер конфигурации
+            text = f"<b>{base_title}</b>\n\n<code>{raw}</code>\n\nКонфигов: <b>{cnt}</b>"
         await edit_message_with_banner(query, "configs", text, kb)
         return
 
@@ -595,7 +790,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("rawcopy:"):
         fname = data.split(":",1)[1]
-        raw = get_public_url(fname) or get_raw_url(fname)
+        if fname.startswith("TEMP_") or fname.startswith("CUSTOM_100_"):
+            raw = get_temp_raw_url(fname)
+        else:
+            raw = get_public_url(fname) or get_raw_url(fname)
         await query.message.reply_text(f"<code>{raw}</code>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
         return
 
@@ -603,12 +801,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fname = data.split(":",1)[1]
         path = DATA_DIR / fname
         if not path.exists():
+            path = Path(__file__).parent.parent / fname
+        if not path.exists():
             await query.message.reply_text("Файл не найден")
             return
         content = path.read_text(encoding="utf-8")
         b64 = base64.b64encode(content.encode('utf-8')).decode('utf-8')
         if len(b64) < 4000:
-            await query.message.reply_text(f"<code>{b64}</code>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
+            await query.message.reply_text(f"<code>{b64}</code>", parse_mode=ParseMode.HTML)
         else:
             b64_path = DATA_DIR / f"{fname.replace('.txt','_base64.txt')}"
             if b64_path.exists():
@@ -617,7 +817,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("qrfile:"):
         fname = data.split(":",1)[1]
-        link = get_public_url(fname) or get_raw_url(fname)
+        if fname.startswith("TEMP_") or fname.startswith("CUSTOM_100_"):
+            link = get_temp_raw_url(fname)
+        else:
+            link = get_public_url(fname) or get_raw_url(fname)
         try:
             qr_bytes = generate_qr_bytes(link)
             await query.message.reply_photo(photo=qr_bytes, caption=f"{fname}\n{link}")
@@ -630,7 +833,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fname = data.split(":",1)[1]
         path = DATA_DIR / fname
         if not path.exists():
-            await update_cache()
+            path = Path(__file__).parent.parent / fname
+        if not path.exists():
+            await update_cache(bot=context.bot)
+            path = DATA_DIR / fname
+            if not path.exists():
+                path = Path(__file__).parent.parent / fname
         if path.exists():
             await query.message.reply_document(document=open(path, "rb"), filename=fname)
         else:
@@ -640,9 +848,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- Message handlers ----------
 
 async def message_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id if update.effective_user else 0
+    user = update.effective_user
+    if user:
+        get_or_create_user(uid, user.username or "", user.first_name or "")
+
+    if not await is_user_subscribed(uid, context.bot):
+        await update.message.reply_text(f"Подпишись на {config.CHANNEL_USERNAME} чтобы пользоваться ботом", reply_markup=sub_required_keyboard())
+        return
+
     text = (update.message.text or "").strip()
     if text == "Главное меню":
-        uid = update.effective_user.id if update.effective_user else None
         await send_initial_banner(update, "main", config.WELCOME_TEXT, main_keyboard(uid))
         return
     if "vless://" in text:
@@ -653,7 +869,7 @@ async def message_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             ok, reason = is_valid_vless(link)
             info = parse_vless_info(link)
             if ok:
-                await update.message.reply_text(f"VLESS: {info.get('remark')}\n{info.get('host')}:{info.get('port')} • валиден", reply_markup=main_keyboard(update.effective_user.id))
+                await update.message.reply_text(f"VLESS: {info.get('remark')}\n{info.get('host')}:{info.get('port')} • валиден", reply_markup=main_keyboard(uid))
             else:
                 await update.message.reply_text(f"Битый VLESS: {reason}")
 
@@ -665,19 +881,24 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_text_handler))
     app.add_handler(CallbackQueryHandler(callback_handler))
-    print(f"Crimson bot @wtfparsbot интервальный {config.UPDATE_INTERVAL}м")
+    print(f"Crimson bot @vpncrimson интервальный {config.UPDATE_INTERVAL}м")
+
     async def _preload():
         try:
-            await update_cache()
-            print(f"Кэш {sum(len(v.get('configs',[])) for v in CACHE.values())}")
+            await update_cache(bot=app.bot)
+            print(f"Кэш {sum(len(v.get('configs',[])) for v in CACHE.values())} VLESS")
         except Exception as e:
             print(f"Ошибка preload: {e}")
-    async def _post_init(app):
+
+    async def _post_init(app_obj):
         if start_health_server:
-            try: await start_health_server()
-            except Exception as e: logger.warning(e)
+            try:
+                await start_health_server()
+            except Exception as e:
+                logger.warning(e)
         await _preload()
-        asyncio.create_task(auto_update_loop(app))
+        asyncio.create_task(auto_update_loop(app_obj))
+
     app.post_init = _post_init
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
@@ -685,7 +906,7 @@ async def auto_update_loop(app):
     await asyncio.sleep(10)
     while True:
         try:
-            await update_cache()
+            await update_cache(bot=app.bot)
         except Exception as e:
             logger.error(e)
         await asyncio.sleep(config.UPDATE_INTERVAL*60)
