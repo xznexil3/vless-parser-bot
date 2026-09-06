@@ -527,22 +527,45 @@ class SourceRegistryTests(unittest.TestCase):
         self.assertIn('"«Проверка и очистка»"', bot_source)
         self.assertNotIn("Проверку и очистку", bot_source)
 
-    def test_main_and_navigation_button_styles(self):
+    def test_main_and_navigation_button_styles_and_unicode_icons(self):
         main_buttons = {
-            button.text: button.style
+            button.callback_data: button
             for row in bot.main_keyboard(config.ADMIN_ID).inline_keyboard
             for button in row
         }
-        self.assertEqual(main_buttons["«Профиль»"], KeyboardButtonStyle.PRIMARY)
-        self.assertEqual(main_buttons["«Белые списки»"], KeyboardButtonStyle.SUCCESS)
-        self.assertEqual(main_buttons["«Черные списки»"], KeyboardButtonStyle.SUCCESS)
-        self.assertEqual(main_buttons["«Полный список»"], KeyboardButtonStyle.SUCCESS)
-        self.assertEqual(main_buttons["«Помощь»"], KeyboardButtonStyle.DANGER)
-        self.assertEqual(main_buttons["«Админ панель»"], KeyboardButtonStyle.DANGER)
+        expected = {
+            "profile": ("👤", KeyboardButtonStyle.PRIMARY),
+            "white": ("⬜", KeyboardButtonStyle.SUCCESS),
+            "black": ("⬛", KeyboardButtonStyle.SUCCESS),
+            "full": ("📚", KeyboardButtonStyle.SUCCESS),
+            "help": ("❔", KeyboardButtonStyle.DANGER),
+            "admin_panel": ("⚙️", KeyboardButtonStyle.DANGER),
+        }
+        for callback_data, (icon, style) in expected.items():
+            with self.subTest(callback_data=callback_data):
+                self.assertTrue(main_buttons[callback_data].text.startswith(icon))
+                self.assertEqual(main_buttons[callback_data].style, style)
+                self.assertIsNone(main_buttons[callback_data].api_kwargs.get("icon_custom_emoji_id"))
 
         back = bot.back_keyboard("admin_panel").inline_keyboard[0][0]
-        self.assertEqual(back.text, "«Назад»")
+        self.assertTrue(back.text.startswith("◀️"))
         self.assertEqual(back.style, KeyboardButtonStyle.PRIMARY)
+        self.assertIsNone(back.api_kwargs.get("icon_custom_emoji_id"))
+
+    def test_configured_custom_emoji_id_is_sent_to_button_and_html(self):
+        with patch.dict(bot.config.CUSTOM_EMOJI_IDS, {"profile": "custom-profile-id"}, clear=True):
+            profile = next(
+                button
+                for row in bot.main_keyboard(config.ADMIN_ID).inline_keyboard
+                for button in row
+                if button.callback_data == "profile"
+            )
+            self.assertEqual(profile.text, "«Профиль»")
+            self.assertEqual(profile.icon_custom_emoji_id, "custom-profile-id")
+            self.assertEqual(
+                bot.render_html("👤 <b>Профиль</b>", bot.config.CUSTOM_EMOJI_IDS),
+                '<tg-emoji emoji-id="custom-profile-id">👤</tg-emoji> <b>Профиль</b>',
+            )
 
     def test_interface_offers_files_without_subscription_links(self):
         bot_source = (ROOT / "src" / "bot.py").read_text(encoding="utf-8")

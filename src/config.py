@@ -1,3 +1,4 @@
+import json
 import os
 from dotenv import load_dotenv
 
@@ -42,6 +43,20 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", os.getenv("GH_TOKEN", ""))
 GITHUB_REPO = os.getenv("GITHUB_REPO", "xznexil3/vless-parser-bot")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
 GITHUB_SUB_PATH = os.getenv("GITHUB_SUB_PATH", "")
+
+# Optional Bot API 9.4 custom emoji IDs. Keep empty for Unicode-only mode.
+# Example: CUSTOM_EMOJI_IDS='{"profile":"6039422865189638057"}'
+try:
+    _custom_emoji_payload = json.loads(os.getenv("CUSTOM_EMOJI_IDS", "{}"))
+except json.JSONDecodeError:
+    _custom_emoji_payload = {}
+if not isinstance(_custom_emoji_payload, dict):
+    _custom_emoji_payload = {}
+CUSTOM_EMOJI_IDS = {
+    str(key): str(value).strip()
+    for key, value in _custom_emoji_payload.items()
+    if str(value).strip()
+}
 
 
 def is_admin(uid: int) -> bool:
@@ -179,38 +194,38 @@ AGGREGATED_SUBS = {
 AGGREGATED_SUBS["COMBINED"] = AGGREGATED_SUBS["FULL"]
 
 
-WELCOME_TEXT = """<b>Free VPN • Crimson</b> — рабочие автообновляемые конфиги для вашего интернета. По вопросам «Помощь»
+WELCOME_TEXT = """<b>🛰️ Free VPN • Crimson</b> — рабочие автообновляемые конфиги для вашего интернета. По вопросам «❔ Помощь»
 
-<b>Два режима:</b>
+<b>🎛️ Два режима:</b>
 
-<b>Черные</b> — весь трафик через VPN
+<b>⬛ Черные</b> — весь трафик через VPN
 
-<b>Белые</b> — для жестких ТСПУ, когда работает только VK / Яндекс
+<b>⬜ Белые</b> — для жестких ТСПУ, когда работает только VK / Яндекс
 
-<i>Построй свой суверенитет в сети с помощью Crimson.</i>"""
+<i>🔐 Построй свой суверенитет в сети с помощью Crimson.</i>"""
 
-FILE_USAGE_TEXT = """<b>Как использовать файл:</b>
-1. Скачай полученный <code>.txt</code> и открой его.
-2. Нажми «Выделить всё», затем «Копировать» — нужно скопировать <b>всё содержимое файла целиком</b>, то есть все строки <code>vless://…</code>, а не одну конфигурацию.
-3. В VPN-клиенте выбери «Импорт из буфера обмена» и вставь <b>весь скопированный текст сразу</b>.
-4. Подтверди импорт: клиент добавит все конфигурации из файла."""
+FILE_USAGE_TEXT = """<b>📄 Как использовать файл:</b>
+1. ⬇️ Скачай полученный <code>.txt</code> и открой его.
+2. 📋 Нажми «Выделить всё», затем «Копировать» — нужно скопировать <b>всё содержимое файла целиком</b>, то есть все строки <code>vless://…</code>, а не одну конфигурацию.
+3. 🔗 В VPN-клиенте выбери «Импорт из буфера обмена» и вставь <b>весь скопированный текст сразу</b>.
+4. ✅ Подтверди импорт: клиент добавит все конфигурации из файла."""
 
-HELP_TEXT = f"""<b>Free VPN • Crimson — помощь</b>
+HELP_TEXT = f"""<b>❔ Free VPN • Crimson — помощь</b>
 
-<b>«Профиль»</b> — твой ID
-<b>«Белые списки»</b> — для ТСПУ
-<b>«Черные списки»</b> — весь трафик через VPN
-<b>«Полный список»</b> — все вместе
+<b>👤 «Профиль»</b> — твой ID
+<b>⬜ «Белые списки»</b> — для ТСПУ
+<b>⬛ «Черные списки»</b> — весь трафик через VPN
+<b>📚 «Полный список»</b> — все вместе
 
-Бот отправляет только готовые <code>.txt</code>-файлы, без ссылок на подписки.
+📄 Бот отправляет только готовые <code>.txt</code>-файлы, без ссылок на подписки.
 
 {FILE_USAGE_TEXT}
 
-Подходящие клиенты: Happ, Hiddify, Streisand, v2rayNG и NekoRay.
-Вопросы — @unnervin"""
+🧩 Подходящие клиенты: Happ, Hiddify, Streisand, v2rayNG и NekoRay.
+💬 Вопросы — @unnervin"""
 
-SOURCES_TEXT = """<b>Источники VLESS</b>
+SOURCES_TEXT = """<b>🗂️ Источники VLESS</b>
 
 Используются только GitHub feed-ы: zieng2, igareck, CID VPN, ByeWhiteLists 2.0, Ghost VPN, AetrisVPN и строгий GitHub-поиск.
 
-Поиск учитывает слова VLESS, VPN, config, list и blacklist. Широкие collection/index-источники отключены. Из файлов принимаются только корректные <b>VLESS</b>; дубликаты удаляются."""
+🔎 Поиск учитывает слова VLESS, VPN, config, list и blacklist. Широкие collection/index-источники отключены. Из файлов принимаются только корректные <b>VLESS</b>; дубликаты удаляются."""

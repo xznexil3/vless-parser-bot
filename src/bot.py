@@ -6,14 +6,13 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from telegram import (
-    InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
     KeyboardButton,
     ReplyKeyboardMarkup,
     Update,
 )
-from telegram.constants import KeyboardButtonStyle, ParseMode
+from telegram.constants import KeyboardButtonStyle, MessageEntityType, ParseMode
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -24,6 +23,7 @@ from telegram.ext import (
 )
 
 import config
+from ui import button as build_ui_button, icon_text, is_main_menu_text, render_html
 from parser import (
     deduplicate_configs,
     fetch_all,
@@ -62,8 +62,15 @@ USERS_FILE = DATA_DIR / "users.json"
 
 MSK = timezone(timedelta(hours=3))
 
+
+def ui_button(icon: str, text: str, **kwargs):
+    """Use a configured custom emoji ID, or the Unicode fallback."""
+    kwargs.setdefault("custom_emoji_id", config.CUSTOM_EMOJI_IDS.get(icon))
+    return build_ui_button(icon, text, **kwargs)
+
+
 REPLY_MENU = ReplyKeyboardMarkup(
-    [[KeyboardButton("Главное меню", style=KeyboardButtonStyle.PRIMARY)]],
+    [[KeyboardButton(icon_text("home", "Главное меню"), style=KeyboardButtonStyle.PRIMARY)]],
     resize_keyboard=True,
     is_persistent=True,
 )
@@ -110,50 +117,18 @@ def get_or_create_user(user_id: int, username: str = "", first_name: str = ""):
 
 def main_keyboard(user_id: int = None):
     kb = [
+        [ui_button("profile", "«Профиль»", callback_data="profile", style=KeyboardButtonStyle.PRIMARY)],
         [
-            InlineKeyboardButton(
-                "«Профиль»",
-                callback_data="profile",
-                style=KeyboardButtonStyle.PRIMARY,
-            )
+            ui_button("white", "«Белые списки»", callback_data="white", style=KeyboardButtonStyle.SUCCESS),
+            ui_button("black", "«Черные списки»", callback_data="black", style=KeyboardButtonStyle.SUCCESS),
         ],
-        [
-            InlineKeyboardButton(
-                "«Белые списки»",
-                callback_data="white",
-                style=KeyboardButtonStyle.SUCCESS,
-            ),
-            InlineKeyboardButton(
-                "«Черные списки»",
-                callback_data="black",
-                style=KeyboardButtonStyle.SUCCESS,
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "«Полный список»",
-                callback_data="full",
-                style=KeyboardButtonStyle.SUCCESS,
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "«Помощь»",
-                callback_data="help",
-                style=KeyboardButtonStyle.DANGER,
-            )
-        ],
+        [ui_button("full", "«Полный список»", callback_data="full", style=KeyboardButtonStyle.SUCCESS)],
+        [ui_button("help", "«Помощь»", callback_data="help", style=KeyboardButtonStyle.DANGER)],
     ]
     if user_id and config.is_admin(user_id):
-        kb.append(
-            [
-                InlineKeyboardButton(
-                    "«Админ панель»",
-                    callback_data="admin_panel",
-                    style=KeyboardButtonStyle.DANGER,
-                )
-            ]
-        )
+        kb.append([
+            ui_button("admin", "«Админ панель»", callback_data="admin_panel", style=KeyboardButtonStyle.DANGER)
+        ])
     return InlineKeyboardMarkup(kb)
 
 
@@ -161,38 +136,12 @@ def admin_keyboard():
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton(
-                    "«Статистика»",
-                    callback_data="admin_stats",
-                    style=KeyboardButtonStyle.PRIMARY,
-                ),
-                InlineKeyboardButton(
-                    "«Обновить кэш»",
-                    callback_data="admin_refresh",
-                    style=KeyboardButtonStyle.SUCCESS,
-                ),
+                ui_button("stats", "«Статистика»", callback_data="admin_stats", style=KeyboardButtonStyle.PRIMARY),
+                ui_button("refresh", "«Обновить кэш»", callback_data="admin_refresh", style=KeyboardButtonStyle.SUCCESS),
             ],
-            [
-                InlineKeyboardButton(
-                    "«Проверка и очистка»",
-                    callback_data="admin_clean",
-                    style=KeyboardButtonStyle.DANGER,
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "«Источники»",
-                    callback_data="admin_sources",
-                    style=KeyboardButtonStyle.PRIMARY,
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "«Назад»",
-                    callback_data="home",
-                    style=KeyboardButtonStyle.PRIMARY,
-                )
-            ],
+            [ui_button("clean", "«Проверка и очистка»", callback_data="admin_clean", style=KeyboardButtonStyle.DANGER)],
+            [ui_button("sources", "«Источники»", callback_data="admin_sources", style=KeyboardButtonStyle.PRIMARY)],
+            [ui_button("back", "«Назад»", callback_data="home", style=KeyboardButtonStyle.PRIMARY)],
         ]
     )
 
@@ -200,33 +149,16 @@ def admin_keyboard():
 def sub_required_keyboard():
     return InlineKeyboardMarkup(
         [
-            [
-                InlineKeyboardButton(
-                    "«Подписаться на канал»",
-                    url=config.CHANNEL_LINK,
-                    style=KeyboardButtonStyle.PRIMARY,
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "«Проверить подписку»",
-                    callback_data="check_sub",
-                    style=KeyboardButtonStyle.SUCCESS,
-                )
-            ],
+            [ui_button("subscribe", "«Подписаться на канал»", url=config.CHANNEL_LINK, style=KeyboardButtonStyle.PRIMARY)],
+            [ui_button("check", "«Проверить подписку»", callback_data="check_sub", style=KeyboardButtonStyle.SUCCESS)],
         ]
     )
 
+
 def back_keyboard(callback_data: str = "home") -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton(
-                "«Назад»",
-                callback_data=callback_data,
-                style=KeyboardButtonStyle.PRIMARY,
-            )
-        ]]
-    )
+    return InlineKeyboardMarkup([
+        [ui_button("back", "«Назад»", callback_data=callback_data, style=KeyboardButtonStyle.PRIMARY)]
+    ])
 
 
 def chunks_keyboard(
@@ -238,34 +170,27 @@ def chunks_keyboard(
     rows = []
     for _, (cfname, _, cnt) in enumerate(chunk_list, 1):
         short = cfname.replace(".txt", "")
-        label = f"«{short} · {cnt}»"
-        button = InlineKeyboardButton(
-            label,
+        chunk_button = ui_button(
+            "chunk",
+            f"«{short} · {cnt}»",
             callback_data=f"chunk:{cfname}",
             style=KeyboardButtonStyle.PRIMARY,
         )
         if not rows or len(rows[-1]) == 2:
-            rows.append([button])
+            rows.append([chunk_button])
         else:
-            rows[-1].append(button)
-    rows.append(
-        [
-            InlineKeyboardButton(
-                "«Скачать полный файл»",
-                callback_data=f"rawfile:{base_filename}",
-                style=KeyboardButtonStyle.SUCCESS,
-            )
-        ]
-    )
-    rows.append(
-        [
-            InlineKeyboardButton(
-                back_label,
-                callback_data=back_data,
-                style=KeyboardButtonStyle.PRIMARY,
-            )
-        ]
-    )
+            rows[-1].append(chunk_button)
+    rows.append([
+        ui_button(
+            "download",
+            "«Скачать полный файл»",
+            callback_data=f"rawfile:{base_filename}",
+            style=KeyboardButtonStyle.SUCCESS,
+        )
+    ])
+    rows.append([
+        ui_button("back", back_label, callback_data=back_data, style=KeyboardButtonStyle.PRIMARY)
+    ])
     return InlineKeyboardMarkup(rows)
 
 
@@ -296,31 +221,20 @@ def aggregate_back_callback(filename: str) -> str:
 def protocol_keyboard(agg_key: str):
     agg = config.AGGREGATED_SUBS.get(agg_key)
     if not agg:
-        return InlineKeyboardMarkup(
-            [[InlineKeyboardButton(
-                "«Назад»",
-                callback_data="home",
-                style=KeyboardButtonStyle.PRIMARY,
-            )]]
-        )
+        return InlineKeyboardMarkup([
+            [ui_button("back", "«Назад»", callback_data="home", style=KeyboardButtonStyle.PRIMARY)]
+        ])
     base = agg["filename"]
     total = AGGREGATED_CACHE.get(base, {}).get("count", "?")
     return InlineKeyboardMarkup(
         [
-            [
-                InlineKeyboardButton(
-                    f"«VLESS · {total}»",
-                    callback_data=f"proto:{agg_key}:all",
-                    style=KeyboardButtonStyle.SUCCESS,
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "«Назад»",
-                    callback_data="home",
-                    style=KeyboardButtonStyle.PRIMARY,
-                )
-            ],
+            [ui_button(
+                "vless",
+                f"«VLESS · {total}»",
+                callback_data=f"proto:{agg_key}:all",
+                style=KeyboardButtonStyle.SUCCESS,
+            )],
+            [ui_button("back", "«Назад»", callback_data="home", style=KeyboardButtonStyle.PRIMARY)],
         ]
     )
 
@@ -533,6 +447,7 @@ def get_banner_path(name: str) -> Path:
     return ASSETS_DIR / f"banner_{name}.png"
 
 async def edit_message_with_banner(query, banner_name: str, text: str, reply_markup):
+    text = render_html(text, config.CUSTOM_EMOJI_IDS)
     banner_path = get_banner_path(banner_name)
     try:
         if banner_path.exists():
@@ -580,6 +495,7 @@ async def edit_message_with_banner(query, banner_name: str, text: str, reply_mar
             logger.error(f"final fallback failed: {e}")
 
 async def send_initial_banner(update: Update, banner_name: str, text: str, reply_markup):
+    text = render_html(text, config.CUSTOM_EMOJI_IDS)
     banner_path = get_banner_path(banner_name)
     if banner_path.exists():
         try:
@@ -603,28 +519,43 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not await is_user_subscribed(uid, context.bot):
         text = (
-            f"<b>Доступ только по подписке</b>\n\n"
-            f"Подпишись на канал {config.CHANNEL_USERNAME}, чтобы пользоваться ботом\n\n"
-            f"После подписки нажми «Проверить подписку»"
+            f"<b>🔒 Доступ только по подписке</b>\n\n"
+            f"📢 Подпишись на канал {config.CHANNEL_USERNAME}, чтобы пользоваться ботом\n\n"
+            f"✅ После подписки нажми «Проверить подписку»"
         )
         await send_initial_banner(update, "main", text, sub_required_keyboard())
         return
 
-    await update.message.reply_text("Клавиатура обновлена — жми «Главное меню» внизу", reply_markup=REPLY_MENU)
+    await update.message.reply_text(
+        render_html("✅ Клавиатура обновлена — жми «🏠 Главное меню» внизу", config.CUSTOM_EMOJI_IDS),
+        parse_mode=ParseMode.HTML,
+        reply_markup=REPLY_MENU,
+    )
     await send_initial_banner(update, "main", config.WELCOME_TEXT, main_keyboard(uid))
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else None
     if not await is_user_subscribed(uid, context.bot):
-        await update.message.reply_text(f"Подпишись на {config.CHANNEL_USERNAME} чтобы продолжить", reply_markup=sub_required_keyboard())
+        await update.message.reply_text(f"📢 Подпишись на {config.CHANNEL_USERNAME}, чтобы продолжить", reply_markup=sub_required_keyboard())
         return
     await send_initial_banner(update, "help", config.HELP_TEXT, main_keyboard(uid))
 
+
+def extract_custom_emoji_ids(message) -> list[str]:
+    """Read custom emoji identifiers from a message sent or forwarded to the bot."""
+    result = []
+    for entity in message.entities or []:
+        if entity.type == MessageEntityType.CUSTOM_EMOJI and entity.custom_emoji_id:
+            if entity.custom_emoji_id not in result:
+                result.append(entity.custom_emoji_id)
+    return result
+
+
 async def handle_main_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text == "Главное меню":
+    if is_main_menu_text(update.message.text):
         uid = update.effective_user.id if update.effective_user else None
         if not await is_user_subscribed(uid, context.bot):
-            await update.message.reply_text(f"Подпишись на {config.CHANNEL_USERNAME}", reply_markup=sub_required_keyboard())
+            await update.message.reply_text(f"📢 Подпишись на {config.CHANNEL_USERNAME}", reply_markup=sub_required_keyboard())
             return True
         await send_initial_banner(update, "main", config.WELCOME_TEXT, main_keyboard(uid))
         return True
@@ -636,7 +567,7 @@ async def show_outdated_file(query, fname: str, back_data: str = "home"):
         base_filename = aggregate["filename"]
         current_chunks = AGGREGATED_CHUNKS.get(base_filename, [])
         text = (
-            f"<b>{fname} больше не существует</b>\n\n"
+            f"<b>⚠️ {fname} больше не существует</b>\n\n"
             "Количество конфигураций изменилось, поэтому пакеты были пересобраны. "
             "Выбери актуальный пакет ниже."
         )
@@ -646,7 +577,7 @@ async def show_outdated_file(query, fname: str, back_data: str = "home"):
             else back_keyboard(back_data)
         )
     else:
-        text = "<b>Файл больше не существует</b>\n\nОткрой список заново."
+        text = "<b>⚠️ Файл больше не существует</b>\n\nОткрой список заново."
         keyboard = back_keyboard(back_data)
     await edit_message_with_banner(query, "configs", text, keyboard)
 
@@ -654,7 +585,7 @@ async def show_outdated_file(query, fname: str, back_data: str = "home"):
 async def send_chunk_file(query, fname, back_data="home"):
     path = local_subscription_path(fname)
     if path is None:
-        await query.message.reply_text("Файл изменился, обновляю список пакетов…")
+        await query.message.reply_text("🔄 Файл изменился, обновляю список пакетов…")
         await update_cache(bot=query.get_bot() if hasattr(query, "get_bot") else None)
         path = local_subscription_path(fname)
 
@@ -670,26 +601,19 @@ async def send_chunk_file(query, fname, back_data="home"):
             title = f"{title} — {fname}"
     cnt = AGGREGATED_CACHE.get(fname, {}).get("count", "?")
     text = (
-        f"<b>{title}</b>\n\n"
-        f"Конфигов в файле: <b>{cnt}</b>\n\n"
+        f"<b>📦 {title}</b>\n\n"
+        f"🔗 Конфигов в файле: <b>{cnt}</b>\n\n"
         f"{config.FILE_USAGE_TEXT}"
     )
     kb = InlineKeyboardMarkup(
         [
-            [
-                InlineKeyboardButton(
-                    "«Скачать .txt»",
-                    callback_data=f"rawfile:{fname}",
-                    style=KeyboardButtonStyle.SUCCESS,
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "«Назад»",
-                    callback_data=back_data,
-                    style=KeyboardButtonStyle.PRIMARY,
-                )
-            ],
+            [ui_button(
+                "download",
+                "«Скачать .txt»",
+                callback_data=f"rawfile:{fname}",
+                style=KeyboardButtonStyle.SUCCESS,
+            )],
+            [ui_button("back", "«Назад»", callback_data=back_data, style=KeyboardButtonStyle.PRIMARY)],
         ]
     )
     await edit_message_with_banner(query, "configs", text, kb)
@@ -731,20 +655,8 @@ async def handle_admin_clean(query):
             f"<b>Проверка не завершена</b>\n\nОшибка: <code>{str(exc)[:300]}</code>",
             InlineKeyboardMarkup(
                 [
-                    [
-                        InlineKeyboardButton(
-                            "«Назад»",
-                            callback_data="admin_panel",
-                            style=KeyboardButtonStyle.PRIMARY,
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "«Главное меню»",
-                            callback_data="home",
-                            style=KeyboardButtonStyle.PRIMARY,
-                        )
-                    ],
+                    [ui_button("back", "«Назад»", callback_data="admin_panel", style=KeyboardButtonStyle.PRIMARY)],
+                    [ui_button("home", "«Главное меню»", callback_data="home", style=KeyboardButtonStyle.PRIMARY)],
                 ]
             ),
         )
@@ -784,20 +696,8 @@ async def handle_admin_clean(query):
         "\n".join(report),
         InlineKeyboardMarkup(
             [
-                [
-                    InlineKeyboardButton(
-                        "«Назад»",
-                        callback_data="admin_panel",
-                        style=KeyboardButtonStyle.PRIMARY,
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "«Главное меню»",
-                        callback_data="home",
-                        style=KeyboardButtonStyle.PRIMARY,
-                    )
-                ],
+                [ui_button("back", "«Назад»", callback_data="admin_panel", style=KeyboardButtonStyle.PRIMARY)],
+                [ui_button("home", "«Главное меню»", callback_data="home", style=KeyboardButtonStyle.PRIMARY)],
             ]
         ),
     )
@@ -817,7 +717,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data != "check_sub":
         if not await is_user_subscribed(uid, context.bot):
             await edit_message_with_banner(query, "main",
-                f"<b>Доступ только по подписке</b>\n\nПодпишись на {config.CHANNEL_USERNAME}, чтобы пользоваться ботом",
+                f"<b>🔒 Доступ только по подписке</b>\n\n📢 Подпишись на {config.CHANNEL_USERNAME}, чтобы пользоваться ботом",
                 sub_required_keyboard())
             return
 
@@ -827,7 +727,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.answer("Ты еще не подписался на канал", show_alert=True)
             await edit_message_with_banner(query, "main",
-                f"<b>Ты еще не подписался</b>\n\nПодпишись на {config.CHANNEL_USERNAME} и нажми проверку",
+                f"<b>⚠️ Ты еще не подписался</b>\n\n📢 Подпишись на {config.CHANNEL_USERNAME} и нажми проверку",
                 sub_required_keyboard())
         return
 
@@ -854,12 +754,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except:
                 pass
         text = (
-            f"<b>Профиль</b>\n\n"
-            f"<b>id:</b>{uid}\n"
+            f"<b>👤 Профиль</b>\n\n"
+            f"<b>🆔 id:</b> {uid}\n"
             f"<b>Username:</b> {username}\n"
-            f"<b>Name:</b> {user.first_name or u.get('first_name') or '—'}\n"
-            f"Caste: {caste}\n\n"
-            f"Дата регистрации\n{reg_date}"
+            f"<b>Имя:</b> {user.first_name or u.get('first_name') or '—'}\n"
+            f"Роль: {caste}\n\n"
+            f"🗓️ Дата регистрации\n{reg_date}"
         )
         await edit_message_with_banner(query, "profile", text, back_keyboard())
         return
@@ -872,7 +772,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not config.is_admin(uid):
             await query.answer("Только для админа", show_alert=True)
             return
-        await edit_message_with_banner(query, "main", "<b>Админ панель</b>\n\nВыбери действие:", admin_keyboard())
+        await edit_message_with_banner(query, "main", "<b>⚙️ Админ панель</b>\n\nВыбери действие:", admin_keyboard())
         return
 
     if data in ("admin_stats", "admin_refresh", "admin_sources", "admin_clean"):
@@ -881,7 +781,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if data == "admin_sources":
             await query.message.reply_text(
-                config.SOURCES_TEXT,
+                render_html(config.SOURCES_TEXT, config.CUSTOM_EMOJI_IDS),
                 parse_mode=ParseMode.HTML,
                 reply_markup=back_keyboard("admin_panel"),
             )
@@ -889,14 +789,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "admin_stats":
             if not CACHE:
                 await update_cache(bot=context.bot)
-            lines = [f"<b>Статистика</b>"]
+            lines = [f"<b>📊 Статистика</b>"]
             total=0
             for k,d in CACHE.items():
                 cnt=len(d.get("configs",[])); total+=cnt
                 lines.append(f"{k}: <b>{cnt}</b>")
             lines.append(f"\nВсего VLESS: <b>{total}</b>")
             await query.message.reply_text(
-                "\n".join(lines),
+                render_html("\n".join(lines), config.CUSTOM_EMOJI_IDS),
                 parse_mode=ParseMode.HTML,
                 reply_markup=back_keyboard("admin_panel"),
             )
@@ -907,7 +807,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except:
                 await query.message.edit_text("Обновляю кэш…")
             await update_cache(bot=context.bot)
-            await edit_message_with_banner(query, "main", f"<b>Готово</b>\n\nОбновлено {datetime.now(MSK).strftime('%H:%M')}", admin_keyboard())
+            await edit_message_with_banner(query, "main", f"<b>✅ Готово</b>\n\n🔄 Обновлено {datetime.now(MSK).strftime('%H:%M')}", admin_keyboard())
             return
         if data == "admin_clean":
             await handle_admin_clean(query)
@@ -920,7 +820,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if base not in AGGREGATED_PROTO_COUNTS:
             await update_cache(bot=context.bot)
         total = AGGREGATED_CACHE.get(base, {}).get("count", "?")
-        text = f"<b>Белые списки</b>\n\nВсего VLESS: <b>{total}</b>\n\nВыбери действие:"
+        text = f"<b>⬜ Белые списки</b>\n\n🔗 Всего VLESS: <b>{total}</b>\n\nВыбери действие:"
         await edit_message_with_banner(query, "protocols", text, protocol_keyboard(agg_key))
         return
 
@@ -931,7 +831,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if base not in AGGREGATED_PROTO_COUNTS:
             await update_cache(bot=context.bot)
         total = AGGREGATED_CACHE.get(base, {}).get("count", "?")
-        text = f"<b>Черные списки</b>\n\nВсего VLESS: <b>{total}</b>\n\nВыбери действие:"
+        text = f"<b>⬛ Черные списки</b>\n\n🔗 Всего VLESS: <b>{total}</b>\n\nВыбери действие:"
         await edit_message_with_banner(query, "protocols", text, protocol_keyboard(agg_key))
         return
 
@@ -942,7 +842,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if base not in AGGREGATED_PROTO_COUNTS:
             await update_cache(bot=context.bot)
         total = AGGREGATED_CACHE.get(base, {}).get("count", "?")
-        text = f"<b>Полный список</b>\n\nВсего VLESS: <b>{total}</b>\n\nВыбери действие:"
+        text = f"<b>📚 Полный список</b>\n\n🔗 Всего VLESS: <b>{total}</b>\n\nВыбери действие:"
         await edit_message_with_banner(query, "protocols", text, protocol_keyboard(agg_key))
         return
 
@@ -965,8 +865,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if back_target not in ("white","black","full"):
             back_target = "home"
         text = (
-            f"<b>{base_title}</b>\n\n"
-            f"Всего VLESS: <b>{cnt}</b>\n\n"
+            f"<b>📦 {base_title}</b>\n\n"
+            f"🔗 Всего VLESS: <b>{cnt}</b>\n\n"
             "Выбери пакет — бот отправит готовый <code>.txt</code>-файл."
         )
         if chunks:
@@ -974,20 +874,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             kb = InlineKeyboardMarkup(
                 [
-                    [
-                        InlineKeyboardButton(
-                            "«Скачать .txt»",
-                            callback_data=f"rawfile:{fname}",
-                            style=KeyboardButtonStyle.SUCCESS,
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            "«К протоколам»",
-                            callback_data=back_target,
-                            style=KeyboardButtonStyle.PRIMARY,
-                        )
-                    ],
+                    [ui_button(
+                        "download",
+                        "«Скачать .txt»",
+                        callback_data=f"rawfile:{fname}",
+                        style=KeyboardButtonStyle.SUCCESS,
+                    )],
+                    [ui_button(
+                        "back",
+                        "«К протоколам»",
+                        callback_data=back_target,
+                        style=KeyboardButtonStyle.PRIMARY,
+                    )],
                 ]
             )
         await edit_message_with_banner(query, "configs", text, kb)
@@ -1022,11 +920,25 @@ async def message_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         get_or_create_user(uid, user.username or "", user.first_name or "")
 
     if not await is_user_subscribed(uid, context.bot):
-        await update.message.reply_text(f"Подпишись на {config.CHANNEL_USERNAME} чтобы пользоваться ботом", reply_markup=sub_required_keyboard())
+        await update.message.reply_text(f"📢 Подпишись на {config.CHANNEL_USERNAME}, чтобы пользоваться ботом", reply_markup=sub_required_keyboard())
         return
 
     text = (update.message.text or "").strip()
-    if text == "Главное меню":
+    custom_ids = extract_custom_emoji_ids(update.message)
+    if custom_ids:
+        rows = [
+            "🔎 Найдены custom emoji ID:",
+            *[f"<code>{custom_id}</code>" for custom_id in custom_ids],
+            "",
+            "Добавь их в CUSTOM_EMOJI_IDS в формате JSON, сопоставив с ключами из src/ui.py.",
+        ]
+        await update.message.reply_text(
+            render_html("\n".join(rows), config.CUSTOM_EMOJI_IDS),
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard(uid),
+        )
+        return
+    if is_main_menu_text(text):
         await send_initial_banner(update, "main", config.WELCOME_TEXT, main_keyboard(uid))
         return
     if "vless://" in text:

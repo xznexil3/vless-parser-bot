@@ -49,6 +49,7 @@ TCP-проверка подтверждает доступность endpoint-а
 ## ✨ Возможности
 
 - интерактивное Telegram-меню с цветными inline-кнопками Bot API 9.4;
+- стандартные Unicode-эмодзи на inline/reply-кнопках и в сообщениях — видны всем пользователям без Premium и Fragment;
 - семантические цвета: синий для навигации, зелёный для списков/скачивания, красный для помощи, админки и очистки;
 - отдельные `WHITE_FULL.txt`, `BLACK_FULL.txt` и `FULL.txt`;
 - отправка только обычных `.txt`-файлов, без URL, base64 и QR;
@@ -80,7 +81,21 @@ pip install -r requirements.txt
 python src/bot.py
 ```
 
-Проект использует `python-telegram-bot 22.8`, поскольку поддержка `style` и `icon_custom_emoji_id` для кнопок появилась в ветке 22.7+.
+Проект использует `python-telegram-bot 22.8` для поддержки `style` кнопок Bot API 9.4.
+
+### Custom Emoji и режим без Premium
+
+По умолчанию используются обычные Unicode-эмодзи (`⬜`, `⬛`, `📚`, `✅` и т. п.) в тексте кнопок и сообщений. Это не требует ни Telegram Premium у владельца, ни дополнительного username бота на Fragment. Цветовые стили `primary`, `success` и `danger` также применяются отдельно.
+
+Для проверки настоящих custom emoji можно передать ID через JSON-переменную `CUSTOM_EMOJI_IDS`:
+
+```dotenv
+CUSTOM_EMOJI_IDS='{"profile":"6039422865189638057","white":"5310169226856644648"}'
+```
+
+Ключи соответствуют названиям в `src/ui.py`. Бот автоматически использует `icon_custom_emoji_id` на кнопках и `<tg-emoji>` в HTML-сообщениях. Чтобы получить ID из готового сообщения, просто отправь или перешли это сообщение боту: он ответит найденными идентификаторами.
+
+Telegram проверяет право на стороне API: для кнопок нужен дополнительный username бота на Fragment, а для сообщений, отправляемых ботом напрямую, — Telegram Premium у владельца либо соответствующее право бота. Если право отсутствует, Telegram вернёт ошибку; код не пытается это ограничение обходить.
 
 ### 3. Docker
 
@@ -138,6 +153,7 @@ python -m py_compile src/*.py tests/*.py
 vless-parser-bot/
 ├── src/
 │   ├── bot.py          # Telegram-бот и admin cleanup
+│   ├── ui.py           # Unicode-эмодзи и Premium-free кнопки
 │   ├── config.py       # источники, зеркала и агрегаты
 │   ├── parser.py       # fetch/extract/validate/dedup/TCP
 │   ├── subscription.py # atomic `.txt`/chunk generation
