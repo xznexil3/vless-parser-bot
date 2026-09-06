@@ -49,19 +49,21 @@ def generate_aggregated_content(profile_title: str, configs: list) -> str:
     return make_subscription_content(configs, header)
 
 def save_subscription_files(base_dir: str, category_key: str, configs: list, profile_title: str, use_igareck_header: bool = False):
+    # Работаем только с .txt, без base64 и без yourdomain
     os.makedirs(base_dir, exist_ok=True)
     header = generate_igareck_style_header(profile_title, len(configs)) if use_igareck_header else generate_header(profile_title, len(configs))
     plain_content = make_subscription_content(configs, header)
     b64_content = base64.b64encode(plain_content.encode('utf-8')).decode('utf-8')
     plain_path = os.path.join(base_dir, f"{category_key}.txt")
-    b64_path = os.path.join(base_dir, f"{category_key}_base64.txt")
+    # base64 больше не создаем на диске, только .txt
     with open(plain_path, "w", encoding="utf-8") as f:
         f.write(plain_content)
-    with open(b64_path, "w", encoding="utf-8") as f:
-        f.write(b64_content)
+    b64_path = os.path.join(base_dir, f"{category_key}_base64.txt")
+    # не пишем base64 файл, возвращаем путь для совместимости
     return plain_path, b64_path, plain_content, b64_content
 
 def save_aggregated_file(base_dir: str, filename: str, profile_title: str, configs: list):
+    # Только .txt на репо, без base64 файлов
     os.makedirs(base_dir, exist_ok=True)
     content = generate_aggregated_content(profile_title, configs)
     path = os.path.join(base_dir, filename)
@@ -69,8 +71,7 @@ def save_aggregated_file(base_dir: str, filename: str, profile_title: str, confi
         f.write(content)
     b64_path = os.path.join(base_dir, filename.replace(".txt", "_base64.txt"))
     b64 = base64.b64encode(content.encode('utf-8')).decode('utf-8')
-    with open(b64_path, "w", encoding="utf-8") as f:
-        f.write(b64)
+    # base64 файл не создаем физически, только .txt
     return path, b64_path, content, b64
 
 CHUNK_SIZE = 300

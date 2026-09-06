@@ -13,7 +13,7 @@ from telegram.constants import ParseMode
 
 import config
 from parser import fetch_all, is_valid_vless, parse_vless_info, is_valid_any
-from subscription import save_subscription_files, generate_qr_bytes, CHUNK_SIZE, save_aggregated_chunks, PROTOCOLS, PROTOCOL_LABELS, filter_by_protocol, save_aggregated_file
+from subscription import save_subscription_files, generate_qr_bytes, CHUNK_SIZE, save_aggregated_chunks, PROTOCOLS, filter_by_protocol, save_aggregated_file
 try:
     from health import start_health_server
 except ImportError:
@@ -29,6 +29,7 @@ ASSETS_DIR.mkdir(exist_ok=True)
 
 CACHE = {}
 LAST_UPDATE = None
+LAST_NOTIFY = None  # для троттлинга уведомлений раз в час
 AGGREGATED_CACHE = {}
 AGGREGATED_CHUNKS = {}
 AGGREGATED_PROTO_COUNTS = {}
@@ -67,7 +68,6 @@ def get_or_create_user(user_id: int, username: str = "", first_name: str = ""):
         }
         save_users(users)
     else:
-        # обновляем username если изменился
         if username and users[uid_str].get("username") != username:
             users[uid_str]["username"] = username
             save_users(users)
@@ -130,13 +130,11 @@ def protocol_keyboard(agg_key: str):
 # ---------- Channel subscription check ----------
 
 async def is_user_subscribed(user_id: int, bot) -> bool:
-    """Проверяет подписку на @vpncrimson"""
     try:
         chat_id = config.REQUIRED_CHANNEL
         member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
         return member.status in ['member', 'administrator', 'creator', 'owner']
     except Exception as e:
-        # Если бот не админ в канале или канал приватный — не блокируем, но логируем
         err_str = str(e).lower()
         if "not enough rights" in err_str or "chat not found" in err_str or "forbidden" in err_str:
             logger.warning(f"Cannot check subscription for {user_id}: {e} — allowing")
@@ -166,6 +164,10 @@ def build_aggregated_configs():
             data = CACHE.get(sk, {})
             for c in data.get("configs", []):
                 if not c.lower().startswith("vless://"):
+                    continue
+                # проверка на рабочие конфиги
+                ok, _ = is_valid_any(c)
+                if not ok:
                     continue
                 if c not in seen:
                     seen.add(c)
@@ -207,8 +209,17 @@ async def push_aggregated_to_github(aggregated_results):
         return {}
 
 async def notify_channel_update(bot, old_total, new_total):
-    """Уведомление в канал @vpncrimson об обновлении списков"""
+    """Уведомление в канал @vpncrimson об обновлении списков — раз в час, без спама"""
+    global LAST_NOTIFY
     if not config.CHANNEL_ID:
+        return
+    now = datetime.now(MSK)
+    # Троттлинг: не чаще раза в час
+    if LAST_NOTIFY and (now - LAST_NOTIFY).total_seconds() < 3600:
+        logger.info("notify throttled, last notify less than 1h ago")
+        return
+    # Только если есть значимые изменения
+    if abs(new_total - old_total) < 5 and old_total != 0:
         return
     try:
         diff = new_total - old_total
@@ -216,10 +227,11 @@ async def notify_channel_update(bot, old_total, new_total):
         text = (
             f"<b>Free VPN • Crimson — списки обновлены</b>\n\n"
             f"Всего VLESS: <b>{new_total}</b> ({sign})\n"
-            f"Дата: {datetime.now(MSK).strftime('%d.%m.%Y %H:%M МСК')}\n\n"
+            f"Дата: {now.strftime('%d.%m.%Y %H:%M МСК')}\n\n"
             f"Получить — @wtfparsbot"
         )
         await bot.send_message(chat_id=config.CHANNEL_ID, text=text, parse_mode=ParseMode.HTML)
+        LAST_NOTIFY = now
         logger.info(f"Notified channel {config.CHANNEL_ID} about update")
     except Exception as e:
         logger.warning(f"Channel notify failed: {e}")
@@ -232,7 +244,19 @@ async def update_cache(categories=None, mode=None, bot=None):
     old_total = sum(len(v.get("configs", [])) for v in CACHE.values()) if CACHE else 0
     result = await fetch_all(mode=mode, categories=categories)
     for key, data in result.items():
-        filtered = [c for c in data.get("configs", []) if c.lower().startswith("vless://")]
+        # Только .txt и только VLESS, сразу фильтруем нерабочие
+        filtered = []
+        seen = set()
+        for c in data.get("configs", []):
+            if not c.lower().startswith("vless://"):
+                continue
+            if c in seen:
+                continue
+            ok, _ = is_valid_any(c)
+            if not ok:
+                continue
+            seen.add(c)
+            filtered.append(c)
         data["configs"] = filtered
         title = config.SOURCES.get(key, {}).get("name", key)
         if filtered:
@@ -252,32 +276,28 @@ async def update_cache(categories=None, mode=None, bot=None):
                 AGGREGATED_CACHE[fname].update({"count": info["count"], "content": info["content"]})
         if config.GITHUB_TOKEN and agg:
             asyncio.create_task(push_aggregated_to_github(agg))
-        # Уведомление в канал если есть изменения
-        if bot and old_total != new_total and abs(new_total - old_total) > 5:
+        # Уведомление в канал раз в час, если есть изменения
+        if bot and old_total != new_total:
             asyncio.create_task(notify_channel_update(bot, old_total, new_total))
     except Exception as e:
         logger.error(f"aggregated error: {e}")
     return result
 
 def get_raw_url(filename: str) -> str:
+    """Только .txt списки которые лежат на репозитории vless-parser-bot, без доменов"""
     cached = AGGREGATED_CACHE.get(filename, {})
     if cached.get("raw_url"):
         return cached["raw_url"]
-    repo = config.GITHUB_REPO
-    branch = config.GITHUB_BRANCH
-    path = f"{config.GITHUB_SUB_PATH}/{filename}" if config.GITHUB_SUB_PATH else filename
-    path = path.lstrip("/")
-    return f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
+    repo = "xznexil3/vless-parser-bot"
+    branch = "main"
+    return f"https://raw.githubusercontent.com/{repo}/{branch}/{filename}"
 
 def get_public_url(filename: str) -> str:
-    if config.PUBLIC_URL:
-        base = config.PUBLIC_URL.rstrip("/")
-        return f"{base}/sub/{filename}"
+    # Исключаем все yourdomain, работаем только с .txt на репо
     return ""
 
 def get_temp_raw_url(filename: str) -> str:
-    """Временный .txt на самом репо vless-parser-bot (без доменов)"""
-    # Используем основной репо бота для временных файлов
+    """Временный .txt на самом репо vless-parser-bot (без доменов), живет 3 часа"""
     repo = "xznexil3/vless-parser-bot"
     branch = "main"
     return f"https://raw.githubusercontent.com/{repo}/{branch}/{filename}"
@@ -288,7 +308,6 @@ def get_banner_path(name: str) -> Path:
     return ASSETS_DIR / f"banner_{name}.png"
 
 async def edit_message_with_banner(query, banner_name: str, text: str, reply_markup):
-    """Редактирует существующее сообщение — не создает новых"""
     banner_path = get_banner_path(banner_name)
     try:
         if banner_path.exists():
@@ -350,17 +369,15 @@ async def send_initial_banner(update: Update, banner_name: str, text: str, reply
             logger.error(f"send banner {banner_name} failed: {e}")
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
 
-# ---------- Temp files (3 часа) ----------
+# ---------- Temp files (3 часа) — только .txt на репо ----------
 
 async def delete_temp_file_from_github(filename: str):
-    """Удаляет временный файл из репо через GitHub API"""
     try:
-        import aiohttp, base64
+        import aiohttp
         token = config.GITHUB_TOKEN
         if not token:
             return
         repo = "xznexil3/vless-parser-bot"
-        # Получаем sha
         async with aiohttp.ClientSession() as session:
             url = f"https://api.github.com/repos/{repo}/contents/{filename}"
             headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
@@ -373,16 +390,29 @@ async def delete_temp_file_from_github(filename: str):
                 return
             payload = {"message": f"delete temp {filename} after 3h", "sha": sha, "branch": "main"}
             async with session.delete(url, headers=headers, json=payload) as resp:
-                txt = await resp.text()
                 if resp.status in (200, 204):
                     logger.info(f"Deleted temp file {filename} from GitHub")
                 else:
+                    txt = await resp.text()
                     logger.warning(f"Delete temp {filename} failed {resp.status}: {txt[:200]}")
     except Exception as e:
         logger.error(f"delete temp file error {filename}: {e}")
 
-async def schedule_temp_deletion(filename: str, delay_seconds: int = 10800):
-    """Удаляет файл через 3 часа"""
+async def notify_temp_deleted(bot, user_id: int, filename: str):
+    """Уведомление от бота что временный список удален"""
+    try:
+        text = (
+            f"<b>Временный файл удален</b>\n\n"
+            f"<code>{filename}</code>\n\n"
+            f"Срок жизни 3 часа истек.\n"
+            f"Собери новую подписку — «Собрать подписку»"
+        )
+        await bot.send_message(chat_id=user_id, text=text, parse_mode=ParseMode.HTML, reply_markup=main_keyboard(user_id))
+    except Exception as e:
+        logger.warning(f"notify temp deleted to {user_id} failed: {e}")
+
+async def schedule_temp_deletion(filename: str, user_id: int, bot, delay_seconds: int = 10800):
+    """Удаляет временный .txt через 3 часа и уведомляет пользователя"""
     await asyncio.sleep(delay_seconds)
     # Удаляем локально
     try:
@@ -401,6 +431,9 @@ async def schedule_temp_deletion(filename: str, delay_seconds: int = 10800):
     # Удаляем из GitHub
     await delete_temp_file_from_github(filename)
     TEMP_FILES.pop(filename, None)
+    # Уведомляем пользователя
+    if bot and user_id:
+        await notify_temp_deleted(bot, user_id, filename)
 
 # ---------- Handlers ----------
 
@@ -409,7 +442,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     get_or_create_user(uid, user.username if user else "", user.first_name if user else "")
 
-    # Проверка подписки на канал
     if not await is_user_subscribed(uid, context.bot):
         text = (
             f"<b>Доступ только по подписке</b>\n\n"
@@ -442,7 +474,6 @@ async def handle_main_menu_text(update: Update, context: ContextTypes.DEFAULT_TY
 async def send_chunk_file(query, fname, back_data="home"):
     path = DATA_DIR / fname
     if not path.exists():
-        # Проверяем в корне репо (временные файлы)
         root_path = Path(__file__).parent.parent / fname
         if root_path.exists():
             path = root_path
@@ -459,11 +490,8 @@ async def send_chunk_file(query, fname, back_data="home"):
                 title = f"{v['profile_title']} — {fname}"
                 break
         cnt = AGGREGATED_CACHE.get(fname, {}).get("count", "?")
-        # Для временных файлов используем прямую ссылку на репо
-        if fname.startswith("TEMP_") or fname.startswith("CUSTOM_100_"):
-            raw = get_temp_raw_url(fname)
-        else:
-            raw = get_public_url(fname) or get_raw_url(fname)
+        # Только .txt на репо, без доменов
+        raw = get_temp_raw_url(fname) if fname.startswith("TEMP_") else get_raw_url(fname)
         text = f"<b>{title}</b>\n\n<code>{raw}</code>\n\nКонфигов: <b>{cnt}</b>"
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("«Скачать файл»", callback_data=f"rawfile:{fname}"), InlineKeyboardButton("«Копировать ссылку»", callback_data=f"rawcopy:{fname}")],
@@ -493,15 +521,15 @@ async def handle_build_subscription(query, user_id):
         for c in v.get("configs", []):
             if not c.lower().startswith("vless://"):
                 continue
+            # проверка на нерабочие конфиги
+            ok, _ = is_valid_any(c)
+            if not ok:
+                continue
             if c not in seen:
                 seen.add(c)
                 all_configs.append(c)
 
-    valid_configs = []
-    for c in all_configs:
-        ok, _ = is_valid_any(c)
-        if ok:
-            valid_configs.append(c)
+    valid_configs = all_configs
 
     if not valid_configs:
         await edit_message_with_banner(query, "configs", "Не удалось найти VLESS. Попробуй обновить кэш.", InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
@@ -510,41 +538,48 @@ async def handle_build_subscription(query, user_id):
     random.shuffle(valid_configs)
     selected = valid_configs[:100] if len(valid_configs) >= 100 else valid_configs
     title = "Free VPN • Crimson — Custom 100"
-    # Временный .txt на самом репо, живет 3 часа
     timestamp = datetime.now(MSK).strftime("%H%M")
     filename = f"TEMP_100_{user_id}_{timestamp}.txt"
 
     try:
-        # Сохраняем в data и в корень репо для пуша
+        # Сохраняем только .txt, без base64, в data и в корень репо для пуша
         path_data, _, content, _ = save_aggregated_file(str(DATA_DIR), filename, title, selected)
         root_path = Path(__file__).parent.parent / filename
         root_path.write_text(content, encoding="utf-8")
 
-        # Пушим в основной репо vless-parser-bot (без доменов, просто raw github)
         raw_url = None
         if config.GITHUB_TOKEN:
             try:
                 from github_sync import push_aggregated_subscriptions
-                # Пушим именно в vless-parser-bot для временных файлов
                 temp_repo = "xznexil3/vless-parser-bot"
                 raw_map = await push_aggregated_subscriptions({filename: content}, temp_repo, config.GITHUB_TOKEN, "main")
                 raw_url = raw_map.get(filename) or get_temp_raw_url(filename)
-                # Если пуш успешен, raw_url уже будет
-                if not raw_url:
-                    raw_url = get_temp_raw_url(filename)
             except Exception as e:
                 logger.error(f"push temp failed: {e}")
                 raw_url = get_temp_raw_url(filename)
         else:
             raw_url = get_temp_raw_url(filename)
 
-        # Сохраняем инфу о временном файле и планируем удаление через 3 часа
         TEMP_FILES[filename] = {
             "user_id": user_id,
             "created_at": datetime.now(MSK).isoformat(),
             "expires_at": (datetime.now(MSK) + timedelta(hours=3)).isoformat()
         }
-        asyncio.create_task(schedule_temp_deletion(filename, 10800))
+        # Планируем удаление через 3 часа с уведомлением
+        bot_instance = query.get_bot() if hasattr(query, 'get_bot') else None
+        # если bot не доступен через query, попробуем context bot позже — пока передаем bot из query
+        try:
+            b = query._bot if hasattr(query, '_bot') else None
+        except:
+            b = None
+        # используем bot_instance или b
+        actual_bot = bot_instance or b
+        # если не удалось получить, все равно планируем удаление без уведомления (фолбек)
+        if actual_bot:
+            asyncio.create_task(schedule_temp_deletion(filename, user_id, actual_bot, 10800))
+        else:
+            # создаем задачу которая попытается получить bot позже — пока без уведомления
+            asyncio.create_task(schedule_temp_deletion(filename, user_id, None, 10800))
 
         AGGREGATED_CACHE[filename] = {"count": len(selected), "content": content, "raw_url": raw_url}
 
@@ -630,11 +665,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = query.from_user.id if query.from_user else 0
     user = query.from_user
 
-    # Сохраняем пользователя для даты регистрации
     if user:
         get_or_create_user(uid, user.username or "", user.first_name or "")
 
-    # Проверка подписки на канал (кроме кнопки проверки)
     if data != "check_sub":
         if not await is_user_subscribed(uid, context.bot):
             await edit_message_with_banner(query, "main",
@@ -658,12 +691,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "profile":
         u = get_or_create_user(uid, user.username if user else "", user.first_name if user else "")
+        caste = "Owner" if config.is_admin(uid) else "Client"
+        username = user.username or u.get('username') or '—'
+        if username != '—' and not username.startswith('@'):
+            username = f"@{username}"
         text = (
             f"<b>Профиль</b>\n\n"
-            f"<b>Id</b>\n<code>{uid}</code>\n\n"
-            f"<b>Username</b>\n@{user.username or u.get('username') or '—'}\n\n"
-            f"<b>Name</b>\n{user.first_name or u.get('first_name') or '—'}\n\n"
-            f"<b>Дата регистрации</b>\n{u.get('registration_date', '—')}"
+            f"id:{uid}\n"
+            f"Username: {username}\n"
+            f"Name: {user.first_name or u.get('first_name') or '—'}\n"
+            f"Caste: {caste}\n\n"
+            f"Дата регистрации\n{u.get('registration_date', '—')}"
         )
         await edit_message_with_banner(query, "profile", text, InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
         return
@@ -673,6 +711,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "build_subscription":
+        # Передаем context.bot для уведомления об удалении
+        query._bot = context.bot
         await handle_build_subscription(query, uid)
         return
 
@@ -761,7 +801,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fname = base
         chunks = AGGREGATED_CHUNKS.get(fname, [])
         cnt = AGGREGATED_CACHE.get(fname, {}).get("count", "?")
-        raw = get_public_url(fname) or get_raw_url(fname)
+        raw = get_raw_url(fname)
         back_target = agg_key.lower().replace("_full","")
         if back_target not in ("white","black","full"):
             back_target = "home"
@@ -790,10 +830,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("rawcopy:"):
         fname = data.split(":",1)[1]
-        if fname.startswith("TEMP_") or fname.startswith("CUSTOM_100_"):
-            raw = get_temp_raw_url(fname)
-        else:
-            raw = get_public_url(fname) or get_raw_url(fname)
+        raw = get_temp_raw_url(fname) if fname.startswith("TEMP_") else get_raw_url(fname)
         await query.message.reply_text(f"<code>{raw}</code>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
         return
 
@@ -817,10 +854,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("qrfile:"):
         fname = data.split(":",1)[1]
-        if fname.startswith("TEMP_") or fname.startswith("CUSTOM_100_"):
-            link = get_temp_raw_url(fname)
-        else:
-            link = get_public_url(fname) or get_raw_url(fname)
+        link = get_temp_raw_url(fname) if fname.startswith("TEMP_") else get_raw_url(fname)
         try:
             qr_bytes = generate_qr_bytes(link)
             await query.message.reply_photo(photo=qr_bytes, caption=f"{fname}\n{link}")
@@ -881,7 +915,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_text_handler))
     app.add_handler(CallbackQueryHandler(callback_handler))
-    print(f"Crimson bot @vpncrimson интервальный {config.UPDATE_INTERVAL}м")
+    print(f"Crimson bot @vpncrimson интервальный {config.UPDATE_INTERVAL}м — только .txt на репо")
 
     async def _preload():
         try:
@@ -909,6 +943,7 @@ async def auto_update_loop(app):
             await update_cache(bot=app.bot)
         except Exception as e:
             logger.error(e)
+        # Автообновление раз в час
         await asyncio.sleep(config.UPDATE_INTERVAL*60)
 
 if __name__ == "__main__":

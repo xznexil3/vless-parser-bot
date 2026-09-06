@@ -17,14 +17,17 @@ REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "@vpncrimson")
 CHANNEL_USERNAME = "@vpncrimson"
 CHANNEL_LINK = "https://t.me/vpncrimson"
 CHECK_MODE = os.getenv("CHECK_MODE", "syntax")
-UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", "30"))
-PUBLIC_URL = os.getenv("PUBLIC_URL", "")
+# Автообновление всех списков раз в час
+UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", "60"))
 PORT = int(os.getenv("PORT", "8080"))
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", os.getenv("GH_TOKEN", ""))
-GITHUB_REPO = os.getenv("GITHUB_REPO", "xznexil3/crs-support-bot")
+# Работаем только с .txt списками которые лежат на репозитории vless-parser-bot, без yourdomain
+GITHUB_REPO = os.getenv("GITHUB_REPO", "xznexil3/vless-parser-bot")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
 GITHUB_SUB_PATH = os.getenv("GITHUB_SUB_PATH", "")
+# Исключаем все yourdomain - работаем только через raw.githubusercontent.com
+PUBLIC_URL = ""  # принудительно пусто, только .txt на репо
 
 def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
