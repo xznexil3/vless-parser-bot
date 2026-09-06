@@ -1,68 +1,96 @@
-# 🛰️ VLESS Парсер Бот — Чёрные и Белые списки
+# 🛰️ VLESS Parser Bot — чёрные и белые списки
 
-Телеграм-бот, который **парсит рабочие VLESS Reality конфигурации с GitHub** и отдаёт их в виде **подписок** (plain + base64) для Happ / Hiddify / Streisand / v2rayNG / NekoRay / Throne.
+Telegram-бот собирает публичные VLESS-конфигурации, проверяет их и публикует plain/base64-подписки для Happ, Hiddify, Streisand, v2rayNG, NekoRay и других совместимых клиентов.
 
-Разделяет конфиги на два режима для РФ:
-
-- **⬛ Чёрные списки** — классический VPN, весь трафик через сервер. Для YouTube, Discord, Twitter, ChatGPT.
-- **⬜ Белые списки** — обход жёстких блокировок (ТСПУ), когда работают только VK/Госуслуги/Яндекс. Только сервера с белыми IP-подсетями (VK, Yandex, CDNVideo, Beeline).
+- **⬜ Белые списки** — конфигурации для сетей с режимом «белых списков».
+- **⬛ Чёрные списки** — конфигурации для обычных блокировок.
+- **Полный список** — объединение обеих групп.
 
 ## 🔗 Источники
 
-Основной: [`igareck/vpn-configs-for-russia`](https://github.com/igareck/vpn-configs-for-russia) — 8.5k ⭐, обновляется каждые 15-30 минут.
+В белый агрегат входят все 11 провайдеров:
 
-| Категория | Файл | Что это |
-|-----------|------|---------|
-| `black_all` | `BLACK_VLESS_RUS.txt` | Чёрные списки — все VLESS (91 шт) |
-| `black_mobile` | `BLACK_VLESS_RUS_mobile.txt` | Топ-150 для телефона |
-| `white_cidr_all` | `WHITE-CIDR-RU-all.txt` | Белые CIDR — все хостеры (~30) |
-| `white_cidr_checked` | `WHITE-CIDR-RU-checked.txt` | Белые VK/YA/CDN/Beeline (~10, самые надёжные) |
-| `white_mobile` | `Vless-Reality-White-Lists-Rus-Mobile.txt` | Белые для телефона (~28) |
-| `white_sni` | `WHITE-SNI-RU-all.txt` | Только Fake SNI |
-| `ss_black` | `BLACK_SS+All_RUS.txt` | Shadowsocks для чёрных |
+| № | Провайдер | Основной feed |
+|---:|---|---|
+| 1 | Сборник подписок против БС | VALCHIK / Codeberg `obhod_WL` |
+| 2 | zieng2 | `zieng2/wl` |
+| 3 | EtoNeYa | `etoneya.su/whitelist` |
+| 4 | igareck | `WHITE-CIDR-RU-all.txt` |
+| 5 | CID VPN | `CidVpn/cid-vpn-config` + CID White |
+| 6 | wrtrmmu | nowmeow whitelist API |
+| 7 | wlrus.lol | wlrus.lol, GitVerse и S3-зеркало |
+| 8 | ByeWhiteLists 2.0 | `ByeWhiteLists/ByeWhiteLists2` |
+| 9 | Vercel | `white-lists.vercel.app/api/filter?code=RU` |
+| 10 | Ghost-vpn.ru | две WhiteListVpn-подписки |
+| 11 | VPN bolt | `RUVIPIEN/russian-white-bolt_fix` |
 
-Fallback: `barry-far/V2ray-Config`, `0xRadikal/Free-v2ray-Configs`, `ebrasha/free-v2ray-public-list`
+Точные URL и порядок зеркал находятся в [`src/config.py`](src/config.py). Для зеркал используется стратегия `first_available`; независимые части одного источника загружаются стратегией `all`.
 
-## ✨ Что умеет бот
+> На момент последней проверки endpoint Vercel возвращает HTTP 404. Он сохранён как канонический источник и автоматически снова начнёт участвовать в агрегате, если deployment восстановят. Ошибка одного провайдера не останавливает остальные источники.
 
-- `/start` — меню с кнопками
-- `/black` / `/black_mobile` — чёрные списки
-- `/white` / `/white_cidr` / `/white_checked` / `/white_mobile` — белые списки
-- `/all` — всё вместе (групповая подписка)
-- `/check vless://...` — проверка синтаксиса + TCP
-- `/sources` — список GitHub-источников
-- `/update` — принудительное обновление
-- `/stats` — статистика по количеству
-- `/sub` — отправить все подписки файлами
+Чёрные feed-ы igareck, EtoNeYa и Ghost VPN зарегистрированы отдельно и не смешиваются с белым агрегатом.
 
-**На каждую категорию бот:**
-- Проверяет синтаксис `vless://UUID@host:port` + опционально TCP
-- Дедуплицирует
-- Генерирует 2 файла: `key.txt` (plain) и `key_base64.txt` (base64-подписка)
-- Отдаёт файлы, base64-текст и QR-код
-- Автообновляет кэш каждые 30 мин (настраивается) + может постить в канал
+## ✅ Извлечение и проверка
 
-## 🚀 Быстрый старт
+Парсер работает только с VLESS и извлекает URI из:
 
-### 1. Создай бота
-1. Напиши [@BotFather](https://t.me/BotFather) → `/newbot` → получи `BOT_TOKEN`
-2. Скопируй `.env.example` → `.env` и вставь токен
+- обычного текста;
+- стандартного и URL-safe base64 payload;
+- base64 по одной строке;
+- JSON- и HTML-экранированного текста.
+
+Для каждого найденного URI проверяются:
+
+- схема `vless://`, canonical UUID, один `uuid@host:port` и порт `1..65535`;
+- публичный IPv4/IPv6 или корректное доменное имя (локальные и служебные адреса отбрасываются);
+- percent-encoding и query-параметры без конфликтующих дубликатов;
+- допустимые `encryption`, `security`, transport `type` и boolean-параметры;
+- SNI/Host и обязательные Reality-поля `pbk`/`publicKey`, SNI, формат short ID;
+- отсутствие лишнего path в самом URI.
+
+Дубликаты удаляются по нормализованной идентичности подключения: порядок query-параметров и remark после `#` не создают отдельный конфиг.
+
+### Режимы `CHECK_MODE`
+
+| Режим | Поведение |
+|---|---|
+| `none` | Без фильтрации на уровне `validate_configs` (агрегатор всё равно принимает только валидный VLESS). |
+| `syntax` | Полная проверка URI, режим по умолчанию для периодического обновления. |
+| `tcp` | Сначала строгая проверка URI, затем ограниченная параллельная TCP-проверка каждого уникального `host:port`. |
+
+Кнопка администратора **«Проверка и очистка»** заново загружает источники, включает режим `tcp`, удаляет невалидные/недоступные конфигурации и перестраивает агрегаты. При временной ошибке provider-а старый кэш этого provider-а не стирается вслепую: его endpoints повторно проверяются.
+
+TCP-проверка подтверждает доступность endpoint-а, но не может гарантировать срок жизни публичного UUID или успешность VLESS-аутентификации без полноценного подключения клиентом.
+
+## ✨ Возможности
+
+- интерактивное Telegram-меню;
+- отдельные `WHITE_FULL.txt`, `BLACK_FULL.txt` и `FULL.txt`;
+- plain-файлы, base64-представление, chunks и QR-коды;
+- автообновление с настраиваемым интервалом;
+- публикация агрегатов через GitHub Contents API;
+- ручная строгая проверка одного вставленного VLESS URI;
+- HTTP endpoint для выдачи сформированных подписок.
+
+## 🚀 Запуск
+
+### 1. Настройка
+
+Создайте бота через [@BotFather](https://t.me/BotFather), затем:
 
 ```bash
 cp .env.example .env
 nano .env
 ```
 
-### 2. Локальный запуск
+### 2. Локально
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
+python3 -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 python src/bot.py
 ```
-
-Бот начнёт парсить GitHub и ответит в Telegram.
 
 ### 3. Docker
 
@@ -71,92 +99,69 @@ docker-compose up -d --build
 docker logs -f vless-parser-bot
 ```
 
-### 4. Переменные окружения
+## ⚙️ Переменные окружения
 
 | Переменная | Описание | По умолчанию |
-|------------|----------|--------------|
+|---|---|---|
 | `BOT_TOKEN` | Токен от @BotFather | — |
-| `ADMIN_ID` | Твой Telegram ID | 0 |
-| `CHANNEL_ID` | Канал для автопостинга (`@channel`) | — |
-| `CHECK_MODE` | `none` / `syntax` / `tcp` | `syntax` |
-| `UPDATE_INTERVAL` | Интервал автообновления, мин | `30` |
-| `PUBLIC_URL` | Для мини HTTP-сервера подписок | — |
-| `PORT` | Порт HTTP | `8080` |
+| `ADMIN_ID` / `ADMIN_IDS` | Telegram ID администратора / список ID | значение в config / пусто |
+| `CHANNEL_ID` | Канал для уведомлений | `@vpncrimson` |
+| `REQUIRED_CHANNEL` | Канал для проверки подписки пользователя | `@vpncrimson` |
+| `CHECK_MODE` | `none`, `syntax` или `tcp` | `syntax` |
+| `UPDATE_INTERVAL` | Интервал автообновления, минут | `60` |
+| `GITHUB_TOKEN` | Токен для публикации агрегатов | — |
+| `GITHUB_REPO` | Репозиторий агрегатов | `xznexil3/vless-parser-bot` |
+| `GITHUB_BRANCH` | Ветка публикации | `main` |
+| `PORT` | Порт health/subscription HTTP-сервера | `8080` |
 
-## 📱 Как подключить подписку
+## 🧠 Pipeline
 
-1. В боте нажми **⬛ Чёрные списки** или **⬜ Белые**
-2. Нажми **📄 Получить файл .txt** — бот пришлёт 2 файла
-3. Открой клиент:
-   - **Happ** (iOS/Android/Win) → `+` → `Добавить из буфера` → вставь содержимое `*_base64.txt`
-   - **Streisand** → `+` → `Import from Clipboard`
-   - **v2rayNG** → `≡` → `Добавить подписку` → вставь ссылку/текст
-   - **Hiddify** / **Throne** → `Добавить профиль` → `Вставить`
-4. Нажми **Обновить подписку** → выбери сервер с меньшей задержкой → **Connect**
-
-### Какую подписку выбрать?
-
-- **Для обычных блокировок (YouTube, Discord):** `black_mobile` — 150 лучших, быстро.
-- **Для белых списков (ничего не грузит кроме VK):** `white_cidr_checked` — VK/YA/CDN, самый надёжный. Если не хватает — `white_cidr_all`.
-- **Хочешь всё сразу:** `/all` — бот соберёт групповую подписку.
-
-## 🧠 Как работает парсер
-
-```
-GitHub raw (.txt) → fetch_text() → extract_configs(VLESS_REGEX) → validate (UUID, host:port) → dedup → save_subscription_files() → Telegram
+```text
+provider/mirror
+  → bounded fetch
+  → plain / escaped / base64 extraction
+  → strict VLESS validation
+  → normalized deduplication
+  → optional bounded TCP checks
+  → source cache
+  → WHITE / BLACK / FULL aggregation
+  → plain + base64 + chunks
 ```
 
-- Поддерживает plain и base64 исходники (авто-декодирует)
-- Игнорирует комментарии `# profile-title`
-- Проверяет UUID v4, порт 1-65535
-- Опционально TCP-чекает `host:port` (mode=tcp)
+## 🧪 Тесты
+
+```bash
+python -m unittest discover -s tests -v
+python -m py_compile src/*.py tests/*.py
+```
+
+Тесты покрывают plain/base64/escaped extraction, VLESS/Reality validation, private host rejection, normalized deduplication, mirror fallback, endpoint check deduplication, 11 обязательных провайдеров и точный текст кнопки администратора.
 
 ## 📂 Структура
 
-```
+```text
 vless-parser-bot/
 ├── src/
-│   ├── bot.py          # Telegram бот (PTB v20)
-│   ├── parser.py       # Парсинг GitHub + валидация
-│   ├── subscription.py # Генерация подписок + QR
-│   └── config.py       # Источники + тексты
-├── data/               # Сгенерированные подписки (*.txt)
+│   ├── bot.py          # Telegram-бот и admin cleanup
+│   ├── config.py       # источники, зеркала и агрегаты
+│   ├── parser.py       # fetch/extract/validate/dedup/TCP
+│   ├── subscription.py # plain/base64/chunk/QR
+│   └── server.py       # HTTP endpoint
+├── tests/
+│   └── test_parser.py
+├── data/               # runtime-файлы
 ├── requirements.txt
-├── .env.example
 ├── Dockerfile
-├── docker-compose.yml
-└── README.md
+└── docker-compose.yml
 ```
-
-## 🔄 Автообновление и канал
-
-Бот каждые `UPDATE_INTERVAL` минут:
-- Перепарсит все источники
-- Обновит файлы в `data/`
-- Если задан `CHANNEL_ID` — отправит сводку в канал
 
 ## ⚠️ Важно
 
-- Конфиги **публичные** — могут умереть за часы. Обновляй подписку в клиенте каждые 6-12 часов.
-- Не заходи с VPN-IP на Госуслуги/банки — палишь сервер для всех.
-- Для белых списков используй **только** белые подписки и включай маршрутизацию `RU-DIRECT`.
-- Бот не логирует твои подписки.
-
-## 🛠️ Расширение
-
-Добавить новый источник — просто добавь URL в `src/config.py` → `SOURCES`:
-
-```python
-"my_source": {
-    "name": "Мой источник",
-    "description": "...",
-    "urls": ["https://raw.githubusercontent.com/.../vless.txt"],
-}
-```
+- Это публичные конфигурации: они могут перестать работать в любой момент.
+- Обновляйте подписку перед использованием.
+- Не используйте недоверенные VPN endpoints для передачи чувствительных данных.
+- Проект не гарантирует доступность сторонних provider-ов.
 
 ## 📄 Лицензия
 
-MIT — делай что хочешь, но без гарантий.
-
----
-Сделано для обхода блокировок в РФ. Подписывайся на [igareck/vpn-configs-for-russia](https://github.com/igareck/vpn-configs-for-russia) — первоисточник.
+MIT, без гарантий.

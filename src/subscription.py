@@ -1,4 +1,5 @@
 import os
+import re
 import base64
 import qrcode
 from io import BytesIO
@@ -33,15 +34,10 @@ def generate_igareck_style_header(profile_title: str, count: int) -> str:
         f"# Date/Time: {msk_igareck_str()}",
         f"# Количество: {count}",
         f"# For more info — {BOT_USERNAME}",
-        f"",
-        f"# RU: Эта подписка может содержать Trojan/Hysteria2/Hy2 с legacy-параметрами insecure=1 или allowInsecure=1.",
-        f"# RU: Такие конфигурации могут вызывать ошибку запуска Xray-core v26.2.6+ в клиентах на Xray-core.",
-        f"# RU: Для совместимости используйте Sing-box для Trojan/Hysteria2/Hy2 или Xray-core v26.1.23.",
-        f"",
-        f"# EN: This subscription may contain Trojan/Hysteria2/Hy2 configs with legacy parameters: insecure=1 or allowInsecure=1.",
-        f"# EN: Such configs may cause Xray-core startup errors with Xray-core v26.2.6+.",
-        f"# EN: For compatibility, use Sing-box for Trojan/Hysteria2/Hy2 or Xray-core v26.1.23.",
-        f"",
+        "",
+        "# Только VLESS. URI проверены; дубликаты удалены.",
+        "# VLESS only. URIs validated; duplicates removed.",
+        "",
     ])
 
 def generate_aggregated_content(profile_title: str, configs: list) -> str:
@@ -79,35 +75,11 @@ CHUNK_SIZE = 300
 # Протоколы — теперь только VLESS (по ТЗ вырезать все остальные)
 PROTOCOLS = ["vless"]
 
-PROTOCOL_LABELS = {
-    "vless": "VLESS",
-    "trojan": "Trojan",
-    "ss": "Shadowsocks",
-    "vmess": "VMess",
-    "hysteria2": "Hysteria2",
-    "tuic": "TUIC",
-}
+PROTOCOL_LABELS = {"vless": "VLESS"}
+
 
 def detect_protocol(link: str) -> str:
-    l = link.lower().strip()
-    if l.startswith("vless://"):
-        return "vless"
-    if l.startswith("trojan://"):
-        return "trojan"
-    if l.startswith("ss://"):
-        return "ss"
-    if l.startswith("vmess://"):
-        return "vmess"
-    if l.startswith("hysteria2://") or l.startswith("hy2://"):
-        return "hysteria2"
-    if l.startswith("tuic://"):
-        return "tuic"
-    if l.startswith("ssr://"):
-        return "ssr"
-    # fallback — до ://
-    if "://" in l:
-        return l.split("://", 1)[0]
-    return "unknown"
+    return "vless" if link.lower().strip().startswith("vless://") else "unknown"
 
 def filter_by_protocol(configs: list, proto: str) -> list:
     if proto == "all":
@@ -122,6 +94,14 @@ def save_aggregated_chunks(base_dir: str, filename: str, profile_title: str, con
     """Делит configs по chunk_size и сохраняет FULL.txt, FULL_1.txt, FULL_2.txt ... Все в стиле Crimson."""
     os.makedirs(base_dir, exist_ok=True)
     base_name = filename.replace(".txt", "")
+    # A smaller refresh must not leave obsolete numbered chunks on disk.
+    chunk_pattern = re.compile(rf"^{re.escape(base_name)}_\d+\.txt$")
+    for existing in os.listdir(base_dir):
+        if chunk_pattern.fullmatch(existing):
+            try:
+                os.remove(os.path.join(base_dir, existing))
+            except OSError:
+                pass
     # Сначала сохраняем полный (для совместимости)
     full_path, full_b64, full_content, full_b64c = save_aggregated_file(base_dir, filename, profile_title, configs)
     chunks = list(chunk_configs(configs, chunk_size))

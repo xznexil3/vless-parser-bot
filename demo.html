@@ -27,36 +27,36 @@ code{background:#242836;padding:2px 6px;border-radius:6px;font-size:13px;word-br
 <body>
 <div class="wrap">
 <h1>🛰️ VLESS Парсер Бот</h1>
-<p class="sub">Парсер рабочих VLESS Reality с GitHub для <b>чёрных</b> и <b>белых</b> списков. Отдаёт подписки в 2 форматах: plain и base64.</p>
+<p class="sub">Агрегатор VLESS для <b>чёрных</b> и <b>белых</b> списков: plain/base64, строгая проверка URI и очистка недоступных endpoints.</p>
 
 <div class="stats">
-<div class="stat"><div>⬛ Чёрные VLESS</div><b>91</b> конфигов</div>
-<div class="stat"><div>📱 Чёрные Mobile</div><b>136</b> конфигов</div>
-<div class="stat"><div>⬜ Белые CIDR ALL</div><b>25</b> конфигов</div>
-<div class="stat"><div>⬜ Белые VK/YA</div><b>20</b> конфигов</div>
+<div class="stat"><div>⬜ Белые источники</div><b>11</b> провайдеров</div>
+<div class="stat"><div>⬛ Агрегат</div><b>BLACK_FULL</b></div>
+<div class="stat"><div>⬜ Агрегат</div><b>WHITE_FULL</b></div>
+<div class="stat"><div>🛰️ Всё вместе</div><b>FULL</b></div>
 </div>
 
 <div class="grid">
 <div class="card">
 <h2>⬛ Чёрные списки</h2>
 <p><span class="badge">VLESS Reality</span> Полный туннель — весь трафик через VPN. Для YouTube, Discord, X, ChatGPT.</p>
-<p>Источник: <code>igareck/BLACK_VLESS_RUS.txt</code></p>
-<a class="btn" href="#" onclick="alert('Запусти бота — файлы появятся в data/black_all.txt')">📄 Получить .txt</a>
+<p>Источники: отдельные black-feed-ы igareck, EtoNeYa и Ghost VPN.</p>
+<a class="btn" href="#" onclick="alert('Запусти бота — файл появится в data/BLACK_FULL.txt')">📄 Получить .txt</a>
 <a class="btn ghost" href="#">📋 base64</a>
 </div>
 <div class="card">
-<h2>⬜ Белые списки CIDR</h2>
-<p><span class="badge">White List</span> Обход жёстких ТСПУ — работают только белые IP (VK, Yandex, Beeline, CDNVideo).</p>
-<p>Источник: <code>WHITE-CIDR-RU-all.txt</code> + <code>checked.txt</code></p>
+<h2>⬜ Белые списки</h2>
+<p><span class="badge">White List</span> Объединённая подписка всех 11 запрошенных провайдеров.</p>
+<p><code>Сборник</code>, <code>zieng2</code>, <code>EtoNeYa</code>, <code>igareck</code>, <code>CID VPN</code>, <code>wrtrmmu</code>, <code>WL RUS</code>, <code>ByeWL 2.0</code>, <code>Vercel</code>, <code>Ghost VPN</code>, <code>VPN bolt</code>.</p>
 <a class="btn" href="#">📄 Получить .txt</a>
 <a class="btn ghost" href="#">📋 base64</a>
 </div>
 </div>
 
 <div class="card">
-<h2>🤖 Команды бота</h2>
-<p><code>/start</code> — меню &nbsp; <code>/black</code> — чёрные &nbsp; <code>/white</code> — белые &nbsp; <code>/white_checked</code> — VK/YA &nbsp; <code>/all</code> — всё &nbsp; <code>/check vless://...</code> — проверка</p>
-<p><code>/update</code> — обновить кэш &nbsp; <code>/stats</code> — статистика &nbsp; <code>/sources</code> — источники</p>
+<h2>🤖 Управление</h2>
+<p><code>/start</code> открывает меню: белый, чёрный и полный агрегаты, профиль и помощь.</p>
+<p>Администратору доступны статистика, обновление кэша, источники и <b>«Проверка и очистка»</b> со строгой VLESS + TCP-проверкой.</p>
 </div>
 
 <div class="card">
@@ -67,16 +67,16 @@ code{background:#242836;padding:2px 6px;border-radius:6px;font-size:13px;word-br
 <li>Вставь в клиент: <b>Happ / Streisand / v2rayNG / Hiddify / Throne / NekoRay</b> → <b>Добавить подписку из буфера</b></li>
 <li>Обнови подписку → выбери сервер с меньшей задержкой → Connect</li>
 </ol>
-<p style="background:#1a1f2e;border-left:3px solid #1e7bff;padding:10px 12px;border-radius:8px">💡 <b>Совет:</b> для белых списков бери <b>VK/YA/CDN</b> (самые живучие). Для чёрных — <b>black_mobile</b> (топ-150). Обновляй подписку каждые 6-12 часов.</p>
+<p style="background:#1a1f2e;border-left:3px solid #1e7bff;padding:10px 12px;border-radius:8px">💡 <b>Совет:</b> обновляй публичную подписку перед использованием: доступность endpoints быстро меняется.</p>
 </div>
 
 <div class="card">
-<h2>🔗 Источники GitHub</h2>
-<p>Основной: <b>igareck/vpn-configs-for-russia</b> (8.5k ⭐) — обновляется каждые 15-30 мин через GitHub Actions.<br>Fallback: barry-far/V2ray-Config, 0xRadikal/Free-v2ray-Configs</p>
-<p>Бот парсит <code>raw.githubusercontent.com</code>, проверяет UUID/host/port, дедуплицирует и генерирует подписки с заголовками <code># profile-title</code> и <code># profile-update-interval</code>.</p>
+<h2>🔗 Извлечение и проверка</h2>
+<p>Поддерживаются plain, JSON/HTML escaping, standard base64, URL-safe base64 и построчный base64. Из payload берутся только <code>vless://</code>.</p>
+<p>Бот проверяет UUID, публичный host, port, query, transport/security и Reality-поля, затем удаляет нормализованные дубликаты. Admin cleanup дополнительно TCP-проверяет каждый уникальный endpoint.</p>
 </div>
 
-<p class="sub" style="text-align:center;margin-top:18px">Готово к деплою: Docker, polling, автообновление каждые 30 мин, постинг в канал. Вставь <code>BOT_TOKEN</code> в <code>.env</code> и запускай <code>python src/bot.py</code></p>
+<p class="sub" style="text-align:center;margin-top:18px">Docker, polling, автообновление и постинг в канал. Вставь <code>BOT_TOKEN</code> в <code>.env</code> и запускай <code>python src/bot.py</code></p>
 </div>
 </body>
 </html>

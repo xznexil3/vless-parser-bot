@@ -12,8 +12,21 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 from telegram.constants import ParseMode
 
 import config
-from parser import fetch_all, is_valid_vless, parse_vless_info, is_valid_any
-from subscription import save_subscription_files, generate_qr_bytes, CHUNK_SIZE, save_aggregated_chunks, PROTOCOLS, filter_by_protocol, save_aggregated_file
+from parser import (
+    deduplicate_configs,
+    fetch_all,
+    is_valid_vless,
+    parse_vless_info,
+    is_valid_any,
+    validate_configs,
+)
+from subscription import (
+    CHUNK_SIZE,
+    generate_qr_bytes,
+    save_aggregated_chunks,
+    save_aggregated_file,
+    save_subscription_files,
+)
 try:
     from health import start_health_server
 except ImportError:
@@ -96,7 +109,7 @@ def admin_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("«Статистика»", callback_data="admin_stats"),
          InlineKeyboardButton("«Обновить кэш»", callback_data="admin_refresh")],
-        [InlineKeyboardButton("«Проверку и очистку»", callback_data="admin_clean")],
+        [InlineKeyboardButton("«Проверка и очистка»", callback_data="admin_clean")],
         [InlineKeyboardButton("«Источники»", callback_data="admin_sources")],
         [InlineKeyboardButton("«Назад»", callback_data="home")],
     ])
@@ -176,6 +189,9 @@ def build_aggregated_configs():
                 if c not in seen:
                     seen.add(c)
                     all_cfgs.append(c)
+        # Providers often publish the same endpoint with another remark or
+        # parameter order. Deduplicate by normalized VLESS identity globally.
+        all_cfgs = deduplicate_configs(all_cfgs)
         try:
             full_path, full_b64, full_content, full_b64c, chunk_infos = save_aggregated_chunks(str(DATA_DIR), filename, title, all_cfgs, CHUNK_SIZE)
             results[filename] = {"content": full_content, "count": len(all_cfgs), "configs": all_cfgs}
@@ -241,6 +257,17 @@ async def update_cache(categories=None, mode=None, bot=None):
     old_total = sum(len(v.get("configs", [])) for v in CACHE.values()) if CACHE else 0
     result = await fetch_all(mode=mode, categories=categories)
     for key, data in result.items():
+        # A provider outage must not erase a previously healthy source. Recheck
+        # its cached VLESS endpoints using the requested mode and retain only
+        # those that still pass.
+        if not data.get("raw_total") and data.get("errors") and CACHE.get(key, {}).get("configs"):
+            cached = CACHE[key]["configs"]
+            fallback = await validate_configs(cached, mode=mode)
+            data["configs"] = fallback
+            data["filtered_total"] = len(fallback)
+            data["removed"] = len(cached) - len(fallback)
+            data["cache_fallback"] = True
+
         # Только .txt и только VLESS, сразу фильтруем нерабочие
         filtered = []
         seen = set()
@@ -606,49 +633,66 @@ async def handle_build_subscription(query, user_id):
 
 async def handle_admin_clean(query):
     try:
-        await query.message.edit_caption(caption="Очищаю нерабочие...", parse_mode=ParseMode.HTML)
-    except:
+        await query.message.edit_caption(
+            caption="Проверяю источники, синтаксис и доступность каждого VLESS endpoint...",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
         try:
-            await query.message.edit_text("Очищаю нерабочие...")
-        except:
+            await query.message.edit_text(
+                "Проверяю источники, синтаксис и доступность каждого VLESS endpoint..."
+            )
+        except Exception:
             pass
 
-    total_before = 0
-    total_after = 0
-    details = []
-    for key, data in list(CACHE.items()):
-        configs = data.get("configs", [])
-        total_before += len(configs)
-        valid = [c for c in configs if c.lower().startswith("vless://")]
-        checked = []
-        for c in valid:
-            ok, _ = is_valid_any(c)
-            if ok:
-                checked.append(c)
-        seen = set()
-        uniq = []
-        for c in checked:
-            if c not in seen:
-                seen.add(c)
-                uniq.append(c)
-        removed = len(configs) - len(uniq)
-        if removed > 0:
-            details.append(f"{key}: -{removed}")
-        CACHE[key]["configs"] = uniq
-        total_after += len(uniq)
-
+    total_before = sum(len(data.get("configs", [])) for data in CACHE.values())
     try:
-        agg = build_aggregated_configs()
-        for fname, info in agg.items():
-            AGGREGATED_CACHE[fname] = {"count": info["count"], "content": info["content"], "raw_url": get_raw_url(fname)}
-        if config.GITHUB_TOKEN and agg:
-            asyncio.create_task(push_aggregated_to_github(agg))
-    except Exception as e:
-        logger.error(f"rebuild after clean failed: {e}")
+        # This is a real refresh, not a second syntax pass over stale CACHE.
+        # ``tcp`` first applies strict VLESS validation, then checks every
+        # unique host:port and removes configs on unreachable endpoints.
+        result = await update_cache(mode="tcp", bot=None)
+    except Exception as exc:
+        logger.exception("admin validation and cleanup failed")
+        await edit_message_with_banner(
+            query,
+            "main",
+            f"<b>Проверка не завершена</b>\n\nОшибка: <code>{str(exc)[:300]}</code>",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("«Назад»", callback_data="admin_panel")],
+                [InlineKeyboardButton("«Главное меню»", callback_data="home")],
+            ]),
+        )
+        return
 
-    text = f"<b>Очистка завершена</b>\n\nБыло: {total_before}\nСтало: {total_after}\nУдалено: {total_before - total_after}\n\n" + ("\n".join(details[:20]) if details else "Все чистые")
+    total_after = sum(len(data.get("configs", [])) for data in CACHE.values())
+    details = []
+    unavailable = []
+    for key, data in result.items():
+        raw_total = data.get("raw_total", 0)
+        kept = len(CACHE.get(key, {}).get("configs", []))
+        removed = data.get("removed", max(0, raw_total - kept))
+        if removed:
+            details.append(f"{key}: {raw_total} → {kept}")
+        if data.get("errors"):
+            marker = " (проверен старый кэш)" if data.get("cache_fallback") else ""
+            unavailable.append(f"{key}{marker}")
 
-    await edit_message_with_banner(query, "main", text, InlineKeyboardMarkup([
+    report = [
+        "<b>Проверка и очистка завершена</b>",
+        "",
+        "Источники загружены заново.",
+        "Проверено: строгий VLESS URI + TCP host:port.",
+        f"В кэше было: <b>{total_before}</b>",
+        f"В кэше стало: <b>{total_after}</b>",
+    ]
+    if details:
+        report.extend(["", "<b>Изменения:</b>", *details[:20]])
+    if unavailable:
+        report.extend(["", "<b>Ошибки/недоступные зеркала:</b>", ", ".join(unavailable[:20])])
+    if not details and not unavailable:
+        report.extend(["", "Все конфигурации прошли проверку."])
+
+    await edit_message_with_banner(query, "main", "\n".join(report), InlineKeyboardMarkup([
         [InlineKeyboardButton("«Назад»", callback_data="admin_panel")],
         [InlineKeyboardButton("«Главное меню»", callback_data="home")]
     ]))

@@ -1,8 +1,8 @@
 """
 Мини HTTP-сервер для отдачи подписок по ссылке.
 Поддерживает как стандартные категории, так и кастомные файлы типа CUSTOM_100_*.txt
-GET /sub/black_all       -> plain подписка
-GET /sub/black_all/b64   -> base64
+GET /sub/BLACK_FULL       -> plain агрегированная подписка
+GET /sub/BLACK_FULL/b64   -> base64
 GET /sub/CUSTOM_100_123.txt -> кастомная подписка (прямо по имени файла)
 GET /                    -> список всех подписок
 """
@@ -35,7 +35,7 @@ async def handle_list(request):
             html.append(f"<li><a href='/sub/{p.name}'>{p.name}</a> — <a href='/sub/{p.name}/b64'>base64</a></li>")
     except:
         pass
-    html.append("</ul><p>Добавь ссылку в клиент как подписку. Обновляется каждые 30 мин.</p>")
+    html.append(f"</ul><p>Добавь ссылку в клиент как подписку. Обновляется каждые {config.UPDATE_INTERVAL} мин.</p>")
     return web.Response(text="".join(html), content_type="text/html")
 
 async def handle_sub(request):
@@ -53,7 +53,7 @@ async def handle_sub(request):
             else:
                 filename = filename.replace(".txt", "_base64.txt")
     else:
-        # 2) Если key — это ключ из SOURCES (black_all и т.д.)
+        # 2) Если key — это ключ из SOURCES (collection, zieng2 и т.д.)
         if key in config.SOURCES:
             filename = f"{key}_base64.txt" if b64 else f"{key}.txt"
         else:
@@ -111,5 +111,5 @@ def create_app():
 if __name__ == "__main__":
     app = create_app()
     port = config.PORT
-    print(f"HTTP подписок на http://0.0.0.0:{port}/sub/black_all")
+    print(f"HTTP подписок на http://0.0.0.0:{port}/sub/BLACK_FULL")
     web.run_app(app, host="0.0.0.0", port=port)
