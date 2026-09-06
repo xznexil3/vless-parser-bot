@@ -527,67 +527,42 @@ class SourceRegistryTests(unittest.TestCase):
         self.assertIn('"«Проверка и очистка»"', bot_source)
         self.assertNotIn("Проверку и очистку", bot_source)
 
-    def test_main_menu_has_one_connect_tab_and_navigation_styles(self):
+    def test_main_and_navigation_button_styles(self):
         main_buttons = {
             button.text: button.style
             for row in bot.main_keyboard(config.ADMIN_ID).inline_keyboard
             for button in row
         }
         self.assertEqual(main_buttons["«Профиль»"], KeyboardButtonStyle.PRIMARY)
-        self.assertEqual(main_buttons["«Подключить»"], KeyboardButtonStyle.SUCCESS)
+        self.assertEqual(main_buttons["«Белые списки»"], KeyboardButtonStyle.SUCCESS)
+        self.assertEqual(main_buttons["«Черные списки»"], KeyboardButtonStyle.SUCCESS)
+        self.assertEqual(main_buttons["«Полный список»"], KeyboardButtonStyle.SUCCESS)
         self.assertEqual(main_buttons["«Помощь»"], KeyboardButtonStyle.DANGER)
         self.assertEqual(main_buttons["«Админ панель»"], KeyboardButtonStyle.DANGER)
-        self.assertNotIn("«Белые списки»", main_buttons)
-        self.assertNotIn("«Черные списки»", main_buttons)
-        self.assertNotIn("«Полный список»", main_buttons)
 
         back = bot.back_keyboard("admin_panel").inline_keyboard[0][0]
         self.assertEqual(back.text, "«Назад»")
         self.assertEqual(back.style, KeyboardButtonStyle.PRIMARY)
 
-    def test_connect_view_lists_source_raw_urls_counts_and_total(self):
-        counts = {
-            "zieng2": 144,
-            "igareck": 25,
-            "cid_vpn": 286,
-            "byewhitelists2": 700,
-            "ghost_vpn": 284,
-            "igareck_black": 103,
-            "ghost_vpn_black": 7,
-            "aetris_vpn": 163,
-            "github_discovery": 300,
-        }
-        cache = {
-            key: {"configs": [f"vless-{index}" for index in range(count)]}
-            for key, count in counts.items()
-        }
-        discovered = "https://raw.githubusercontent.com/new/feed/main/vless_config.txt"
-        cache["github_discovery"]["used_urls"] = [discovered]
+    def test_interface_offers_files_without_subscription_links(self):
+        bot_source = (ROOT / "src" / "bot.py").read_text(encoding="utf-8")
+        self.assertNotIn("get_raw_url", bot_source)
+        self.assertNotIn("«Копировать", bot_source)
+        self.assertNotIn("generate_qr_bytes", bot_source)
+        self.assertIn("«Скачать .txt»", bot_source)
+        self.assertIn("config.FILE_USAGE_TEXT", bot_source)
+        self.assertIn(config.FILE_USAGE_TEXT, config.HELP_TEXT)
+        self.assertIn("всё содержимое файла целиком", config.FILE_USAGE_TEXT)
+        self.assertIn("весь скопированный текст сразу", config.FILE_USAGE_TEXT)
+        self.assertNotIn("скопируй нужную строку", config.FILE_USAGE_TEXT)
 
-        pages = bot.build_connect_pages(cache)
-        text = "\n".join(pages)
-        self.assertTrue(all(len(page) <= 3900 for page in pages))
-        self.assertIn("• <b>Подписка zieng2</b>", text)
-        self.assertIn(config.SOURCES["zieng2"]["urls"][0], text)
-        self.assertIn("<b>144 конфигураций</b>", text)
-        self.assertIn("• <b>Подписка igareck</b>", text)
-        self.assertIn("<b>25 конфигураций</b>", text)
-        self.assertIn(discovered, text)
-        self.assertIn("<b>Всего VLESS: 2012</b>", text)
-        self.assertNotIn("Белые списки", text)
-        self.assertNotIn("Черные списки", text)
-
-    def test_connect_view_exposes_only_github_raw_feeds(self):
-        data = {
-            "used_urls": [
-                "https://example.com/not-allowed.txt",
-                config.SOURCES["aetris_vpn"]["urls"][0],
-            ]
-        }
-        self.assertEqual(
-            bot.source_subscription_urls("aetris_vpn", data),
-            [config.SOURCES["aetris_vpn"]["urls"][0]],
-        )
+    def test_obsolete_chunk_callback_resolves_to_current_aggregate(self):
+        key, aggregate = bot.aggregate_for_filename("BLACK_FULL_6.txt")
+        self.assertEqual(key, "BLACK_FULL")
+        self.assertEqual(aggregate["filename"], "BLACK_FULL.txt")
+        self.assertEqual(bot.aggregate_back_callback("BLACK_FULL_6.txt"), "black")
+        with patch.object(bot, "AGGREGATED_CACHE", {"BLACK_FULL.txt": {}}):
+            self.assertIsNone(bot.local_subscription_path("BLACK_FULL_6.txt"))
 
     def test_custom_subscription_builder_is_fully_removed(self):
         checked_files = [
