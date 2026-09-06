@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import random
+import base64
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -27,8 +28,8 @@ DATA_DIR.mkdir(exist_ok=True)
 CACHE = {}
 LAST_UPDATE = None
 AGGREGATED_CACHE = {}
-AGGREGATED_CHUNKS = {}  # filename -> list of (chunk_filename, title, count)
-AGGREGATED_PROTO_COUNTS = {}  # filename (base) -> {proto: count}
+AGGREGATED_CHUNKS = {}
+AGGREGATED_PROTO_COUNTS = {}
 
 MSK = timezone(timedelta(hours=3))
 def msk_time():
@@ -58,15 +59,6 @@ def admin_keyboard():
         [InlineKeyboardButton("«Назад»", callback_data="home")],
     ])
 
-def category_keyboard(category_key: str):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("«Получить файл»", callback_data=f"file:{category_key}"),
-         InlineKeyboardButton("«Копировать»", callback_data=f"copy:{category_key}")],
-        [InlineKeyboardButton("«Показать 5»", callback_data=f"preview:{category_key}"),
-         InlineKeyboardButton("«QR»", callback_data=f"qr:{category_key}")],
-        [InlineKeyboardButton("«Назад»", callback_data="home")],
-    ])
-
 def chunks_keyboard(base_filename: str, chunk_list, back_data: str = "home", back_label: str = "«Назад»"):
     rows = []
     for idx, (cfname, title, cnt) in enumerate(chunk_list, 1):
@@ -81,7 +73,6 @@ def chunks_keyboard(base_filename: str, chunk_list, back_data: str = "home", bac
     return InlineKeyboardMarkup(rows)
 
 def protocol_keyboard(agg_key: str):
-    """Кнопки выбора протокола для agg_key: WHITE_FULL / BLACK_FULL / FULL"""
     agg = config.AGGREGATED_SUBS.get(agg_key)
     if not agg:
         return InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]])
@@ -109,10 +100,7 @@ def protocol_keyboard(agg_key: str):
     rows.append([InlineKeyboardButton("«Назад»", callback_data="home")])
     return InlineKeyboardMarkup(rows)
 
-# ---------- Aggregated ----------
-
 def build_aggregated_configs():
-    from subscription import generate_aggregated_content
     results = {}
     chunk_map = {}
     proto_counts_map = {}
@@ -126,7 +114,6 @@ def build_aggregated_configs():
         source_keys = agg["source_keys"]
         all_cfgs = []
         seen = set()
-        # Если source_keys пустой (CUSTOM_100) — пропускаем, он создается отдельно
         if agg_key == "CUSTOM_100" and not source_keys:
             continue
         for sk in source_keys:
@@ -161,7 +148,6 @@ def build_aggregated_configs():
                         results[cfname] = {"content": ccontent, "count": cnt, "configs": [], "is_chunk": True}
                         p_chunk_list.append((cfname, ctitle, cnt))
                     chunk_map[proto_filename] = p_chunk_list
-                    logger.info(f"  └─ {proto_filename}: {len(filtered)} -> {len(p_chunk_infos)} чанков")
                 except Exception as e:
                     logger.error(f"proto build {proto_filename} error: {e}")
             proto_counts_map[filename] = proto_counts
@@ -174,7 +160,6 @@ def build_aggregated_configs():
 
 async def push_aggregated_to_github(aggregated_results):
     if not config.GITHUB_TOKEN or not config.GITHUB_REPO:
-        logger.info("GITHUB пуш пропущен")
         return {}
     try:
         from github_sync import push_aggregated_subscriptions
@@ -209,7 +194,6 @@ async def update_cache(categories=None, mode=None):
             except Exception as e:
                 logger.error(f"save error {key}: {e}")
         CACHE[key] = data
-    global LAST_UPDATE
     LAST_UPDATE = datetime.now(MSK)
     try:
         agg = build_aggregated_configs()
@@ -233,6 +217,13 @@ def get_raw_url(filename: str) -> str:
     path = f"{config.GITHUB_SUB_PATH}/{filename}" if config.GITHUB_SUB_PATH else filename
     path = path.lstrip("/")
     return f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
+
+def get_public_url(filename: str) -> str:
+    """Если задан PUBLIC_URL — отдаем ссылку через наш HTTP сервер /sub/"""
+    if config.PUBLIC_URL:
+        base = config.PUBLIC_URL.rstrip("/")
+        return f"{base}/sub/{filename}"
+    return ""
 
 # ---------- Handlers ----------
 
@@ -259,8 +250,6 @@ async def handle_main_menu_text(update: Update, context: ContextTypes.DEFAULT_TY
         return True
     return False
 
-def get_cached(k): return CACHE.get(k)
-
 async def send_chunk_file(query, fname, back_data="home"):
     path = DATA_DIR / fname
     if not path.exists():
@@ -282,18 +271,25 @@ async def send_chunk_file(query, fname, back_data="home"):
                 break
         cnt = AGGREGATED_CACHE.get(fname, {}).get("count", "?")
         raw = get_raw_url(fname)
-        await query.message.reply_text(f"<b>{title}</b>\n<code>{raw}</code>\nКонфигов: <b>{cnt}</b>", parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Скачать файл»", callback_data=f"rawfile:{fname}"), InlineKeyboardButton("«Копировать ссылку»", callback_data=f"rawcopy:{fname}")],[InlineKeyboardButton("«Назад»", callback_data=back_data)]]))
+        public = get_public_url(fname)
+        link = public or raw
+        await query.message.reply_text(
+            f"<b>{title}</b>\n<code>{link}</code>\nКонфигов: <b>{cnt}</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("«Скачать файл»", callback_data=f"rawfile:{fname}"), InlineKeyboardButton("«Копировать ссылку»", callback_data=f"rawcopy:{fname}")],
+                [InlineKeyboardButton("«Назад»", callback_data=back_data)]
+            ])
+        )
         try:
             await query.message.reply_document(document=open(path, "rb"), filename=fname, caption=f"{title} • {cnt}")
         except Exception as e:
             logger.error(e)
 
 async def handle_build_subscription(query, user_id):
-    await query.message.edit_text("Собираю подписку из 100 рабочих конфигов, подожди...")
+    await query.message.edit_text("Собираю подписку из 100 рабочих конфигов, подожди 5-10 сек...")
     if not CACHE:
         await update_cache()
-    # Собираем все конфиги из кэша
     all_configs = []
     seen = set()
     for k, v in CACHE.items():
@@ -301,64 +297,91 @@ async def handle_build_subscription(query, user_id):
             if c not in seen:
                 seen.add(c)
                 all_configs.append(c)
-    # Дополнительная валидация на рабочие (синтаксис)
     valid_configs = []
     for c in all_configs:
         ok, _ = is_valid_any(c)
         if ok:
             valid_configs.append(c)
     if not valid_configs:
-        await query.message.edit_text("Не удалось найти рабочие конфиги. Попробуй обновить кэш.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
+        await query.message.edit_text(
+            "Не удалось найти рабочие конфиги. Попробуй обновить кэш.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]])
+        )
         return
     random.shuffle(valid_configs)
-    need = 100
-    selected = valid_configs[:need] if len(valid_configs) >= need else valid_configs
-    # Сохраняем
+    selected = valid_configs[:100] if len(valid_configs) >= 100 else valid_configs
+
     title = "Free VPN • Crimson — Custom 100"
-    filename = "CUSTOM_100.txt"
-    user_filename = f"CUSTOM_100_{user_id}.txt"
+    # ОДНА подписка на пользователя — удобно и без конфликтов
+    filename = f"CUSTOM_100_{user_id}.txt"
+
     try:
-        path, b64_path, content, b64 = save_aggregated_file(str(DATA_DIR), filename, title, selected)
-        path_user, _, _, _ = save_aggregated_file(str(DATA_DIR), user_filename, title, selected)
-        raw_url = get_raw_url(filename)
-        raw_url_user = get_raw_url(user_filename)
-        # Пуш в гитхаб если настроен
+        path, b64_path, content, b64_content = save_aggregated_file(str(DATA_DIR), filename, title, selected)
+
+        # Пытаемся запушить в GitHub (чтобы ссылка не давала 404)
+        raw_url = None
+        public_url = get_public_url(filename)
+
         if config.GITHUB_TOKEN and config.GITHUB_REPO:
             try:
                 from github_sync import push_aggregated_subscriptions
-                to_push = {}
-                p1 = f"{config.GITHUB_SUB_PATH}/{filename}" if config.GITHUB_SUB_PATH else filename
-                p2 = f"{config.GITHUB_SUB_PATH}/{user_filename}" if config.GITHUB_SUB_PATH else user_filename
-                to_push[p1.lstrip("/")] = content
-                to_push[p2.lstrip("/")] = content
-                raw_map = await push_aggregated_subscriptions(to_push, config.GITHUB_REPO, config.GITHUB_TOKEN, config.GITHUB_BRANCH)
-                for p, url in raw_map.items():
-                    if p.endswith(filename):
-                        raw_url = url
-                    if p.endswith(user_filename):
-                        raw_url_user = url
+                p = f"{config.GITHUB_SUB_PATH}/{filename}" if config.GITHUB_SUB_PATH else filename
+                p = p.lstrip("/")
+                raw_map = await push_aggregated_subscriptions({p: content}, config.GITHUB_REPO, config.GITHUB_TOKEN, config.GITHUB_BRANCH)
+                raw_url = raw_map.get(p)
+                if raw_url:
+                    # Проверяем доступность (иногда GitHub отдает 404 первые секунды)
+                    await asyncio.sleep(1)
             except Exception as e:
                 logger.error(f"push custom failed: {e}")
-        AGGREGATED_CACHE[filename] = {"count": len(selected), "content": content, "raw_url": raw_url}
-        AGGREGATED_CACHE[user_filename] = {"count": len(selected), "content": content, "raw_url": raw_url_user}
+
+        # Выбираем ОДНУ основную ссылку — приоритет: PUBLIC_URL > GitHub > нет ссылки
+        primary_link = public_url or raw_url
+        if primary_link:
+            link_text = f"<code>{primary_link}</code>"
+        else:
+            link_text = "Ссылка будет доступна после включения PUBLIC_URL или GITHUB. Пока используй файл ниже."
+
+        AGGREGATED_CACHE[filename] = {"count": len(selected), "content": content, "raw_url": raw_url or primary_link or get_raw_url(filename)}
 
         text = (
-            f"<b>Готово — собрано {len(selected)} конфигов</b>\n\n"
-            f"Ссылка на подписку:\n<code>{raw_url_user}</code>\n\n"
-            f"Общая ссылка (обновляется):\n<code>{raw_url}</code>\n\n"
-            f"Количество: <b>{len(selected)}</b>\n\n"
-            f"Добавь эту ссылку в Happ / Streisand / v2rayNG как URL подписки."
+            f"<b>Готово — собрано {len(selected)} рабочих конфигов</b>\n\n"
+            f"{'Ссылка на подписку:' if primary_link else ''}\n{link_text}\n\n"
+            f"Количество: <b>{len(selected)}</b>\n"
+            f"Файл: <code>{filename}</code>\n\n"
+            f"Добавь ссылку в Happ / Streisand / v2rayNG как URL подписки. "
+            f"Если ссылка не открывается — просто скачай файл и импортируй его."
         )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("«Скопировать ссылку»", callback_data=f"rawcopy:{user_filename}"), InlineKeyboardButton("«Скачать файл»", callback_data=f"rawfile:{user_filename}")],
-            [InlineKeyboardButton("«Собрать еще раз»", callback_data="build_subscription")],
-            [InlineKeyboardButton("«Назад»", callback_data="home")]
+
+        # Удобные кнопки — все что нужно в одном месте
+        kb_rows = []
+        if primary_link:
+            kb_rows.append([InlineKeyboardButton("«Скопировать ссылку»", callback_data=f"rawcopy:{filename}")])
+        kb_rows.append([
+            InlineKeyboardButton("«Скачать файл»", callback_data=f"rawfile:{filename}"),
+            InlineKeyboardButton("«Скопировать base64»", callback_data=f"b64copy:{filename}")
         ])
-        await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        kb_rows.append([
+            InlineKeyboardButton("«Показать QR»", callback_data=f"qrfile:{filename}"),
+            InlineKeyboardButton("«Собрать еще раз»", callback_data="build_subscription")
+        ])
+        kb_rows.append([InlineKeyboardButton("«Назад»", callback_data="home")])
+
+        await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb_rows))
+
         try:
-            await query.message.reply_document(document=open(path_user, "rb"), filename=user_filename, caption=f"Custom 100 • {len(selected)} конфигов")
+            await query.message.reply_document(document=open(path, "rb"), filename=filename, caption=f"Custom 100 • {len(selected)} конфигов • {filename}")
         except Exception as e:
             logger.error(e)
+
+        # Также отправляем base64 файл для клиентов которым нужен base64
+        try:
+            b64_path_obj = DATA_DIR / f"{filename.replace('.txt','_base64.txt')}"
+            if b64_path_obj.exists():
+                await query.message.reply_document(document=open(b64_path_obj, "rb"), filename=b64_path_obj.name, caption=f"Base64 • {len(selected)}")
+        except Exception as e:
+            logger.error(e)
+
     except Exception as e:
         logger.error(f"build custom error: {e}")
         await query.message.edit_text(f"Ошибка при сборке подписки: {e}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
@@ -376,7 +399,6 @@ async def handle_admin_clean(query):
             ok, _ = is_valid_any(c)
             if ok:
                 valid.append(c)
-        # дедупликация
         seen = set()
         uniq_valid = []
         for c in valid:
@@ -389,7 +411,6 @@ async def handle_admin_clean(query):
         CACHE[key]["configs"] = uniq_valid
         CACHE[key]["filtered_total"] = len(uniq_valid)
         total_after += len(uniq_valid)
-    # Пересборка агрегированных
     try:
         agg = build_aggregated_configs()
         for fname, info in agg.items():
@@ -570,7 +591,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«К протоколам»", callback_data=agg_key.lower().replace("_full",""))]])
             )
             return
-        raw = get_raw_url(fname)
+        raw = get_public_url(fname) or get_raw_url(fname)
         back_target = agg_key.lower().replace("_full","")
         if back_target not in ("white","black","full"):
             back_target = "home"
@@ -613,9 +634,42 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("rawcopy:"):
         fname = data.split(":",1)[1]
-        raw = get_raw_url(fname)
+        raw = get_public_url(fname) or get_raw_url(fname)
         await query.message.reply_text(f"<code>{raw}</code>", parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
+        return
+
+    if data.startswith("b64copy:"):
+        fname = data.split(":",1)[1]
+        path = DATA_DIR / fname
+        if not path.exists():
+            await query.message.reply_text("Файл не найден")
+            return
+        content = path.read_text(encoding="utf-8")
+        b64 = base64.b64encode(content.encode('utf-8')).decode('utf-8')
+        # Отправляем как файл + текст (телеграм не дает скопировать слишком длинный текст, поэтому файл)
+        if len(b64) < 4000:
+            await query.message.reply_text(f"<code>{b64}</code>", parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
+        else:
+            b64_path = DATA_DIR / f"{fname.replace('.txt','_base64.txt')}"
+            await query.message.reply_text(
+                f"Base64 подписка слишком длинная для сообщения, вот файл. Скопируй содержимое файла и вставь в клиент.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]])
+            )
+            if b64_path.exists():
+                await query.message.reply_document(document=open(b64_path, "rb"), filename=b64_path.name)
+        return
+
+    if data.startswith("qrfile:"):
+        fname = data.split(":",1)[1]
+        link = get_public_url(fname) or get_raw_url(fname)
+        try:
+            qr_bytes = generate_qr_bytes(link)
+            await query.message.reply_photo(photo=qr_bytes, caption=f"QR для {fname}\n{link}")
+        except Exception as e:
+            logger.error(f"qr error: {e}")
+            await query.message.reply_text(f"Не удалось создать QR: {e}")
         return
 
     if data.startswith("rawfile:"):
@@ -639,7 +693,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fname = config.AGGREGATED_SUBS[agg_key]["filename"]
         title = config.AGGREGATED_SUBS[agg_key]["profile_title"]
         cnt = AGGREGATED_CACHE.get(fname, {}).get("count", "—")
-        raw = get_raw_url(fname)
+        raw = get_public_url(fname) or get_raw_url(fname)
         text = f"<b>{title}</b>\n<code>{raw}</code>\nКонфигов: <b>{cnt}</b>"
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("«Скопировать»", callback_data=f"rawcopy:{fname}"), InlineKeyboardButton("«Скачать»", callback_data=f"rawfile:{fname}")],[InlineKeyboardButton("«Назад»", callback_data="home")]])
         await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
@@ -669,16 +723,6 @@ async def message_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 await update.message.reply_text(f"VLESS: {info.get('remark')}\n{info.get('host')}:{info.get('port')} • валиден", reply_markup=main_keyboard(update.effective_user.id))
             else:
                 await update.message.reply_text(f"Битый VLESS: {reason}")
-
-def get_raw_url(filename: str) -> str:
-    cached = AGGREGATED_CACHE.get(filename, {})
-    if cached.get("raw_url"):
-        return cached["raw_url"]
-    repo = config.GITHUB_REPO
-    branch = config.GITHUB_BRANCH
-    path = f"{config.GITHUB_SUB_PATH}/{filename}" if config.GITHUB_SUB_PATH else filename
-    path = path.lstrip("/")
-    return f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
 
 # ---------- Main ----------
 
