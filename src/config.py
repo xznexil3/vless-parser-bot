@@ -188,9 +188,22 @@ SOURCES = {
             "https://raw.githubusercontent.com/SilentGhostCodes/WhiteListVpn/refs/heads/main/BlackList.txt",
         ],
     },
+    "aetris_vpn": {
+        "name": "AetrisVPN — black",
+        "description": "Автообновляемая VLESS-подписка AetrisVPN",
+        "url_strategy": "first_available",
+        "urls": [
+            "https://raw.githubusercontent.com/flaafix/AetrisVPN-black-list/main/configs.txt",
+        ],
+    },
 }
 
-BLACK_SOURCE_KEYS = ["igareck_black", "etoneya_black", "ghost_vpn_black"]
+BLACK_SOURCE_KEYS = [
+    "igareck_black",
+    "etoneya_black",
+    "ghost_vpn_black",
+    "aetris_vpn",
+]
 WHITE_SOURCE_KEYS = list(REQUIRED_PROVIDER_KEYS)
 FULL_SOURCE_KEYS = WHITE_SOURCE_KEYS + BLACK_SOURCE_KEYS
 

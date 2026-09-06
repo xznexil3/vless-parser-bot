@@ -441,6 +441,16 @@ class SourceRegistryTests(unittest.TestCase):
             )
         )
 
+    def test_aetris_is_fetched_into_black_and_full_aggregates(self):
+        self.assertEqual(
+            config.SOURCES["aetris_vpn"]["urls"],
+            ["https://raw.githubusercontent.com/flaafix/AetrisVPN-black-list/main/configs.txt"],
+        )
+        self.assertIn("aetris_vpn", config.BLACK_SOURCE_KEYS)
+        self.assertIn("aetris_vpn", config.AGGREGATED_SUBS["BLACK_FULL"]["source_keys"])
+        self.assertIn("aetris_vpn", config.AGGREGATED_SUBS["FULL"]["source_keys"])
+        self.assertNotIn("aetris_vpn", config.AGGREGATED_SUBS["WHITE_FULL"]["source_keys"])
+
     def test_admin_label_is_exact(self):
         bot_source = (ROOT / "src" / "bot.py").read_text(encoding="utf-8")
         self.assertIn('"«Проверка и очистка»"', bot_source)

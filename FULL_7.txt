@@ -1,4 +1,4 @@
-# profile-title: Free VPN • Crimson — Black — 2
+# profile-title: Free VPN • Crimson — Full — 7
 # profile-update-interval: 1
 # Date/Time: 2026-09-07 / 01:19 (Moscow)
 # Количество: 300
@@ -7,10 +7,6 @@
 # Только VLESS. URI проверены; дубликаты удалены.
 # VLESS only. URIs validated; duplicates removed.
 
-vless://51505e81-fa2c-44bf-9564-8c053f006535@109.169.37.43:443?type=raw&security=reality&flow=xtls-rprx-vision&fp=firefox&pbk=SiSky02wHz-S0TDHKFTdYhnrlT8Y3CfRsekZlcdLXDY&sid=fd55b698ee8c3629&sni=foodnetwork.com#0264
-vless://3ab5119a-d0e9-4feb-c748-2b42b7367d21@38.127.121.44:53856?type=tcp&security=reality&fp=chrome&pbk=rwpbqas_HY8knlW0fFSIeUrjgBXHBzSNboflsLD8elA&sni=www.speedtest.net&packetEncoding=none#0265
-vless://8384341b-cd89-4a21-a022-cc4bd4e648ca@46.29.238.139:40443?type=raw&security=reality&fp=firefox&pbk=7i4Y7v80NVAIi_4_9roDkqcXmexIHli87dfZuFaQMUI&sid=68da&sni=deepl.com#0267
-vless://16529590-1702-4e7d-90d8-e64f4e18c1e2@109.169.84.94:443?type=raw&security=reality&flow=xtls-rprx-vision&fp=firefox&pbk=vvpu_ljhBuTWmM9w5Hl6jj8ZTiE_JYq29S77zNDeCjQ&sid=ff6975658b6cefce&sni=strapi.io#0268
 vless://11046a7c-fa1b-4653-ab87-400feb465540@172.64.147.52:8880?type=ws&sni=172.64.147.52#0269
 vless://77777777-8a3e-6666-b6d1-a9c5f0e8b3a2@172.64.52.230:2087?type=ws&security=tls&fp=chrome&sni=faxf32gkfzoxqv.fx6hsv0.ccwu.cc&ed=2560#0270
 vless://19f4ec52-5c17-495f-803f-7b2a085b9339@104.16.242.208:8880?type=ws&sni=104.16.242.208#0271
@@ -307,3 +303,7 @@ vless://6cbc63c1-97de-4460-847c-7fd7bdda3fa6@45.82.31.129:190?security=reality&s
 vless://b10e8a5b-82bd-4040-935d-6462eaf4f78e@cseven.trost-shield.ru:443?encryption=none&type=xhttp&path=%2Fuploadfiles%2F&host=cseven.trost-shield.ru&mode=packet-up&extra=%7B%22mode%22%3A%22packet-up%22%2C%22path%22%3A%22%2Fuploadfiles%2F%22%2C%22xPaddingKey%22%3A%22_dc%22%2C%22xPaddingHeader%22%3A%22X-Cache%22%2C%22xPaddingMethod%22%3A%22tokenish%22%2C%22uplinkHTTPMethod%22%3A%22GET%22%2C%22xPaddingObfsMode%22%3Atrue%2C%22xPaddingPlacement%22%3A%22queryInHeader%22%7D&security=tls&sni=cseven.trost-shield.ru&fp=chrome&alpn=h3%2Ch2%2Chttp%2F1.1#%F0%9F%87%B7%F0%9F%87%BA%20AetrisVPN
 vless://ecf789a5-edc3-4eef-bdea-837d048afd9a@31.77.203.216:7443?security=reality&encryption=none&pbk=8qUiIosG5-OQWo0tD29BQCbxb50neUg8BynxdAvDzB4&headerType=none&fp=firefox&type=tcp&flow=xtls-rprx-vision&sni=setbacks.hb-website.ru-msk.vkcloud-storage.ru&sid=132142#%F0%9F%87%AB%F0%9F%87%AE%20AetrisVPN
 vless://142d1453-9cfe-4045-8e54-f3fb33342185@104.21.74.214:8880?security=none&type=ws&host=lively-scene-744f.107-47a.workers.dev&path=%2Fpyip#%F0%9F%87%A7%F0%9F%87%AA%20AetrisVPN
+vless://44e1eece-99e8-4e15-89dc-86c584e543a1@beatrice.pcdlinkguadian.top:19246?encryption=none&security=reality&sni=www.tesla.com&pbk=zHrps6IQU-eosDd7ikdvrxzpuduxtcqi6pPmFLL_GEo&sid=4dd1&fp=qq&allowInsecure=0&flow=xtls-rprx-vision&type=tcp#%F0%9F%87%A7%F0%9F%87%AA%20AetrisVPN
+vless://0325e30e-7505-477e-aa32-7f73a3cc0153@cdn7-02.cdn-vkvideo.com:443?flow=xtls-rprx-vision&fp=safari&pbk=MpuwI3YH2g3YWHKLuQwwgD_qLo-UmUtZe8L1KXOKxhA&security=reality&sid=b0d8f964b7ac8ac0&sni=cdn7-02.cdn-vkvideo.com&type=tcp#%F0%9F%87%A8%F0%9F%87%AD%20AetrisVPN
+vless://0a322246-8c1a-47cd-9865-cccebbb2e5c1@31.76.64.248:443?flow=xtls-rprx-vision&fp=firefox&pbk=9OV_GN4lgwY_4llPfYCGev-PPXLMj-hfYnveKF4tjws&security=reality&sid=f8&sni=blog.api.www.cloudflare.com&type=tcp#%F0%9F%87%BA%F0%9F%87%B8%20AetrisVPN
+vless://b10e8a5b-82bd-4040-935d-6462eaf4f78e@top.trosty.online:443?encryption=none&flow=xtls-rprx-vision&type=tcp&headerType=none&security=reality&sni=top.trosty.online&fp=firefox&pbk=z8gFAOzxHg2FBPVeRNKjuzNxMT45q7EKXbbRfzFyFAQ&sid=08767eeac6268dd3&spx=%2F#%F0%9F%87%B7%F0%9F%87%BA%20AetrisVPN
