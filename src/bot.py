@@ -63,7 +63,7 @@ def get_or_create_user(user_id: int, username: str = "", first_name: str = ""):
         users[uid_str] = {
             "username": username or "",
             "first_name": first_name or "",
-            "registration_date": datetime.now(MSK).strftime("%d.%m.%Y"),
+            "registration_date": datetime.now(MSK).strftime("%d.%m.%Y %H:%M МСК"),
             "first_seen": datetime.now(MSK).isoformat()
         }
         save_users(users)
@@ -71,6 +71,11 @@ def get_or_create_user(user_id: int, username: str = "", first_name: str = ""):
         if username and users[uid_str].get("username") != username:
             users[uid_str]["username"] = username
             save_users(users)
+        # обновляем формат даты если старый
+        old_date = users[uid_str].get("registration_date", "")
+        if old_date and "МСК" not in old_date:
+            # оставляем как есть, но новые будут с временем
+            pass
     return users[uid_str]
 
 # ---------- Keyboards ----------
@@ -81,7 +86,6 @@ def main_keyboard(user_id: int = None):
         [InlineKeyboardButton("«Белые списки»", callback_data="white"),
          InlineKeyboardButton("«Черные списки»", callback_data="black")],
         [InlineKeyboardButton("«Полный список»", callback_data="full")],
-        [InlineKeyboardButton("«Собрать подписку»", callback_data="build_subscription")],
         [InlineKeyboardButton("«Помощь»", callback_data="help")],
     ]
     if user_id and config.is_admin(user_id):
@@ -92,7 +96,7 @@ def admin_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("«Статистика»", callback_data="admin_stats"),
          InlineKeyboardButton("«Обновить кэш»", callback_data="admin_refresh")],
-        [InlineKeyboardButton("«Очистить нерабочие»", callback_data="admin_clean")],
+        [InlineKeyboardButton("«Проверку и очистку»", callback_data="admin_clean")],
         [InlineKeyboardButton("«Источники»", callback_data="admin_sources")],
         [InlineKeyboardButton("«Назад»", callback_data="home")],
     ])
@@ -209,21 +213,14 @@ async def push_aggregated_to_github(aggregated_results):
         return {}
 
 async def notify_channel_update(bot, old_total, new_total):
-    """Уведомление в канал @vpncrimson об обновлении списков — раз в час, без спама"""
+    """Уведомление в канал @vpncrimson об обновлении списков — каждый раз когда обновляю кэш"""
     global LAST_NOTIFY
     if not config.CHANNEL_ID:
         return
     now = datetime.now(MSK)
-    # Троттлинг: не чаще раза в час
-    if LAST_NOTIFY and (now - LAST_NOTIFY).total_seconds() < 3600:
-        logger.info("notify throttled, last notify less than 1h ago")
-        return
-    # Только если есть значимые изменения
-    if abs(new_total - old_total) < 5 and old_total != 0:
-        return
     try:
         diff = new_total - old_total
-        sign = f"+{diff}" if diff > 0 else str(diff)
+        sign = f"+{diff}" if diff > 0 else str(diff) if diff != 0 else "0"
         text = (
             f"<b>Free VPN • Crimson — списки обновлены</b>\n\n"
             f"Всего VLESS: <b>{new_total}</b> ({sign})\n"
@@ -232,7 +229,7 @@ async def notify_channel_update(bot, old_total, new_total):
         )
         await bot.send_message(chat_id=config.CHANNEL_ID, text=text, parse_mode=ParseMode.HTML)
         LAST_NOTIFY = now
-        logger.info(f"Notified channel {config.CHANNEL_ID} about update")
+        logger.info(f"Notified channel {config.CHANNEL_ID} about update {old_total}->{new_total}")
     except Exception as e:
         logger.warning(f"Channel notify failed: {e}")
 
@@ -695,25 +692,31 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         username = user.username or u.get('username') or '—'
         if username != '—' and not username.startswith('@'):
             username = f"@{username}"
+        # жирный id, username, name, форзацы как просил
+        reg_date = u.get('registration_date', '—')
+        # если старый формат без времени, добавляем время
+        if reg_date and "МСК" not in reg_date and "." in reg_date:
+            # конвертим старую дату в новый формат с временем first_seen если есть
+            try:
+                fs = u.get('first_seen')
+                if fs:
+                    dt = datetime.fromisoformat(fs)
+                    reg_date = dt.astimezone(MSK).strftime("%d.%m.%Y %H:%M МСК")
+            except:
+                pass
         text = (
             f"<b>Профиль</b>\n\n"
-            f"id:{uid}\n"
-            f"Username: {username}\n"
-            f"Name: {user.first_name or u.get('first_name') or '—'}\n"
+            f"<b>id:</b>{uid}\n"
+            f"<b>Username:</b> {username}\n"
+            f"<b>Name:</b> {user.first_name or u.get('first_name') or '—'}\n"
             f"Caste: {caste}\n\n"
-            f"Дата регистрации\n{u.get('registration_date', '—')}"
+            f"Дата регистрации\n{reg_date}"
         )
         await edit_message_with_banner(query, "profile", text, InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
         return
 
     if data == "help":
         await edit_message_with_banner(query, "help", config.HELP_TEXT, InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
-        return
-
-    if data == "build_subscription":
-        # Передаем context.bot для уведомления об удалении
-        query._bot = context.bot
-        await handle_build_subscription(query, uid)
         return
 
     if data == "admin_panel":
