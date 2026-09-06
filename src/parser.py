@@ -488,33 +488,12 @@ async def check_tcp(host: str, port: int, timeout: float = 3.0) -> bool:
         return False
 
 def is_valid_any(link: str) -> Tuple[bool, str]:
+    # Теперь только VLESS (по ТЗ)
     low = link.lower().strip()
     if low.startswith("vless://"):
         return is_valid_vless(link)
-    if low.startswith("vmess://"):
-        return is_valid_vmess(link)
-    if low.startswith("trojan://"):
-        return is_valid_trojan(link)
-    if low.startswith("ss://"):
-        return is_valid_ss(link)
-    if low.startswith("hysteria2://") or low.startswith("hy2://"):
-        return is_valid_hysteria2(link)
-    if low.startswith("tuic://"):
-        return is_valid_tuic(link)
-    if "://" not in link:
-        return False, "нет ://"
-    # generic: check length and host:port
-    if len(link) < 15:
-        return False, "too short"
-    hp = extract_host_port(link)
-    if hp:
-        host, port = hp
-        if is_bad_host(host):
-            return False, "bad host generic"
-        if not 1 <= port <= 65535:
-            return False, "bad port generic"
-        return True, "ok generic"
-    return False, "unknown proto or no host"
+    # Все остальные протоколы вырезаны — считаем невалидными
+    return False, "only vless allowed"
 
 async def validate_configs(links: List[str], mode: str = "syntax", allow_generic: bool = False) -> List[str]:
     """Фильтрует невалидные конфиги. mode: none | syntax | tcp"""
@@ -574,8 +553,8 @@ async def fetch_category(session: aiohttp.ClientSession, category_key: str, mode
     if not cfg:
         return {"key": category_key, "name": category_key, "configs": [], "raw_text": "", "error": "unknown category"}
     
-    # Всегда берём все протоколы — потом делим по фильтрам в боте
-    proto = "all"
+    # Теперь только VLESS (по ТЗ вырезать все остальные протоколы)
+    proto = "vless"
     
     all_configs = []
     raw_parts = []

@@ -75,8 +75,8 @@ def save_aggregated_file(base_dir: str, filename: str, profile_title: str, confi
 
 CHUNK_SIZE = 300
 
-# Протоколы для разделения (режимы)
-PROTOCOLS = ["vless", "trojan", "ss", "vmess", "hysteria2", "tuic"]
+# Протоколы — теперь только VLESS (по ТЗ вырезать все остальные)
+PROTOCOLS = ["vless"]
 
 PROTOCOL_LABELS = {
     "vless": "VLESS",
