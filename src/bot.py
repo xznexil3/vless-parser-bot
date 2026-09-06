@@ -1,15 +1,29 @@
 import os
 import asyncio
 import logging
-import random
 import base64
 import json
 from datetime import datetime, timezone, timedelta
+from io import BytesIO
 from pathlib import Path
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
-from telegram.constants import ParseMode
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
+from telegram.constants import KeyboardButtonStyle, ParseMode
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 import config
 from parser import (
@@ -22,9 +36,9 @@ from parser import (
 )
 from subscription import (
     CHUNK_SIZE,
+    cleanup_stale_aggregate_chunks,
     generate_qr_bytes,
     save_aggregated_chunks,
-    save_aggregated_file,
     save_subscription_files,
 )
 try:
@@ -46,12 +60,16 @@ LAST_NOTIFY = None  # для троттлинга уведомлений раз 
 AGGREGATED_CACHE = {}
 AGGREGATED_CHUNKS = {}
 AGGREGATED_PROTO_COUNTS = {}
-TEMP_FILES = {}  # filename -> {user_id, created_at, expires_at}
+UPDATE_LOCK = asyncio.Lock()
 USERS_FILE = DATA_DIR / "users.json"
 
 MSK = timezone(timedelta(hours=3))
 
-REPLY_MENU = ReplyKeyboardMarkup([[KeyboardButton("Главное меню")]], resize_keyboard=True, is_persistent=True)
+REPLY_MENU = ReplyKeyboardMarkup(
+    [[KeyboardButton("Главное меню", style=KeyboardButtonStyle.PRIMARY)]],
+    resize_keyboard=True,
+    is_persistent=True,
+)
 
 # ---------- Users (для даты регистрации) ----------
 
@@ -95,54 +113,219 @@ def get_or_create_user(user_id: int, username: str = "", first_name: str = ""):
 
 def main_keyboard(user_id: int = None):
     kb = [
-        [InlineKeyboardButton("«Профиль»", callback_data="profile")],
-        [InlineKeyboardButton("«Белые списки»", callback_data="white"),
-         InlineKeyboardButton("«Черные списки»", callback_data="black")],
-        [InlineKeyboardButton("«Полный список»", callback_data="full")],
-        [InlineKeyboardButton("«Помощь»", callback_data="help")],
+        [
+            InlineKeyboardButton(
+                "«Профиль»",
+                callback_data="profile",
+                style=KeyboardButtonStyle.PRIMARY,
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "«Белые списки»",
+                callback_data="white",
+                style=KeyboardButtonStyle.SUCCESS,
+            ),
+            InlineKeyboardButton(
+                "«Черные списки»",
+                callback_data="black",
+                style=KeyboardButtonStyle.SUCCESS,
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "«Полный список»",
+                callback_data="full",
+                style=KeyboardButtonStyle.SUCCESS,
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "«Помощь»",
+                callback_data="help",
+                style=KeyboardButtonStyle.DANGER,
+            )
+        ],
     ]
     if user_id and config.is_admin(user_id):
-        kb.append([InlineKeyboardButton("«Админ панель»", callback_data="admin_panel")])
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    "«Админ панель»",
+                    callback_data="admin_panel",
+                    style=KeyboardButtonStyle.DANGER,
+                )
+            ]
+        )
     return InlineKeyboardMarkup(kb)
 
+
 def admin_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("«Статистика»", callback_data="admin_stats"),
-         InlineKeyboardButton("«Обновить кэш»", callback_data="admin_refresh")],
-        [InlineKeyboardButton("«Проверка и очистка»", callback_data="admin_clean")],
-        [InlineKeyboardButton("«Источники»", callback_data="admin_sources")],
-        [InlineKeyboardButton("«Назад»", callback_data="home")],
-    ])
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "«Статистика»",
+                    callback_data="admin_stats",
+                    style=KeyboardButtonStyle.PRIMARY,
+                ),
+                InlineKeyboardButton(
+                    "«Обновить кэш»",
+                    callback_data="admin_refresh",
+                    style=KeyboardButtonStyle.SUCCESS,
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "«Проверка и очистка»",
+                    callback_data="admin_clean",
+                    style=KeyboardButtonStyle.DANGER,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "«Источники»",
+                    callback_data="admin_sources",
+                    style=KeyboardButtonStyle.PRIMARY,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "«Назад»",
+                    callback_data="home",
+                    style=KeyboardButtonStyle.PRIMARY,
+                )
+            ],
+        ]
+    )
+
 
 def sub_required_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("«Подписаться на канал»", url=config.CHANNEL_LINK)],
-        [InlineKeyboardButton("«Проверить подписку»", callback_data="check_sub")]
-    ])
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "«Подписаться на канал»",
+                    url=config.CHANNEL_LINK,
+                    style=KeyboardButtonStyle.PRIMARY,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "«Проверить подписку»",
+                    callback_data="check_sub",
+                    style=KeyboardButtonStyle.SUCCESS,
+                )
+            ],
+        ]
+    )
 
-def chunks_keyboard(base_filename: str, chunk_list, back_data: str = "home", back_label: str = "«Назад»"):
+def back_keyboard(callback_data: str = "home") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton(
+                "«Назад»",
+                callback_data=callback_data,
+                style=KeyboardButtonStyle.PRIMARY,
+            )
+        ]]
+    )
+
+
+def chunks_keyboard(
+    base_filename: str,
+    chunk_list,
+    back_data: str = "home",
+    back_label: str = "«Назад»",
+):
     rows = []
     for _, (cfname, _, cnt) in enumerate(chunk_list, 1):
-        short = cfname.replace(".txt","")
+        short = cfname.replace(".txt", "")
         label = f"«{short} · {cnt}»"
-        if len(rows)==0 or len(rows[-1])==2:
-            rows.append([InlineKeyboardButton(label, callback_data=f"chunk:{cfname}")])
+        button = InlineKeyboardButton(
+            label,
+            callback_data=f"chunk:{cfname}",
+            style=KeyboardButtonStyle.PRIMARY,
+        )
+        if not rows or len(rows[-1]) == 2:
+            rows.append([button])
         else:
-            rows[-1].append(InlineKeyboardButton(label, callback_data=f"chunk:{cfname}"))
-    rows.append([InlineKeyboardButton(f"«Скачать полный файл»", callback_data=f"rawfile:{base_filename}")])
-    rows.append([InlineKeyboardButton(back_label, callback_data=back_data)])
+            rows[-1].append(button)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "«Скачать полный файл»",
+                callback_data=f"rawfile:{base_filename}",
+                style=KeyboardButtonStyle.SUCCESS,
+            )
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                back_label,
+                callback_data=back_data,
+                style=KeyboardButtonStyle.PRIMARY,
+            )
+        ]
+    )
     return InlineKeyboardMarkup(rows)
+
+
+def aggregate_for_filename(filename: str):
+    """Resolve an aggregate or numbered chunk, including old button names."""
+    for aggregate_key, aggregate in config.AGGREGATED_SUBS.items():
+        base_filename = aggregate["filename"]
+        base_name = base_filename.removesuffix(".txt")
+        if filename == base_filename:
+            return aggregate_key, aggregate
+        prefix = f"{base_name}_"
+        if filename.startswith(prefix) and filename.endswith(".txt"):
+            number = filename[len(prefix):-4]
+            if number.isdigit():
+                return aggregate_key, aggregate
+    return None, None
+
+
+def aggregate_back_callback(filename: str) -> str:
+    aggregate_key, _ = aggregate_for_filename(filename)
+    if aggregate_key:
+        candidate = aggregate_key.lower().replace("_full", "")
+        if candidate in {"white", "black", "full"}:
+            return candidate
+    return "home"
+
 
 def protocol_keyboard(agg_key: str):
     agg = config.AGGREGATED_SUBS.get(agg_key)
     if not agg:
-        return InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]])
+        return InlineKeyboardMarkup(
+            [[InlineKeyboardButton(
+                "«Назад»",
+                callback_data="home",
+                style=KeyboardButtonStyle.PRIMARY,
+            )]]
+        )
     base = agg["filename"]
     total = AGGREGATED_CACHE.get(base, {}).get("count", "?")
-    rows = []
-    rows.append([InlineKeyboardButton(f"«VLESS · {total}»", callback_data=f"proto:{agg_key}:all")])
-    rows.append([InlineKeyboardButton("«Назад»", callback_data="home")])
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"«VLESS · {total}»",
+                    callback_data=f"proto:{agg_key}:all",
+                    style=KeyboardButtonStyle.SUCCESS,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "«Назад»",
+                    callback_data="home",
+                    style=KeyboardButtonStyle.PRIMARY,
+                )
+            ],
+        ]
+    )
 
 # ---------- Channel subscription check ----------
 
@@ -175,8 +358,6 @@ def build_aggregated_configs():
         source_keys = agg["source_keys"]
         all_cfgs = []
         seen = set()
-        if agg_key == "CUSTOM_100" and not source_keys:
-            continue
         for sk in source_keys:
             data = CACHE.get(sk, {})
             for c in data.get("configs", []):
@@ -203,10 +384,57 @@ def build_aggregated_configs():
             proto_counts_map[filename] = {"vless": len(all_cfgs)}
         except Exception as e:
             logger.error(f"aggregated build {filename} error: {e}")
-    global AGGREGATED_CHUNKS, AGGREGATED_PROTO_COUNTS
+    return results, chunk_map, proto_counts_map
+
+
+def activate_aggregated_configs(results, chunk_map, proto_counts_map, raw_map=None):
+    """Atomically expose one complete generated/publication generation."""
+    global AGGREGATED_CACHE, AGGREGATED_CHUNKS, AGGREGATED_PROTO_COUNTS
+    raw_map = raw_map or {}
+    new_cache = {}
+    for filename, info in results.items():
+        relative_path = (
+            f"{config.GITHUB_SUB_PATH}/{filename}"
+            if config.GITHUB_SUB_PATH
+            else filename
+        ).lstrip("/")
+        raw_url = raw_map.get(relative_path, "")
+        if config.PUBLIC_URL:
+            raw_url = f"{config.PUBLIC_URL}/sub/{filename}"
+        elif not raw_url and not config.GITHUB_SUB_PATH:
+            # A committed bootstrap file is safe only when it has exactly the
+            # same bytes as the generation now being activated.
+            repository_path = Path(__file__).parent.parent / filename
+            try:
+                if (
+                    repository_path.is_file()
+                    and repository_path.read_text(encoding="utf-8") == info["content"]
+                ):
+                    raw_url = (
+                        f"https://raw.githubusercontent.com/{config.GITHUB_REPO}/"
+                        f"{config.GITHUB_BRANCH}/{filename}"
+                    )
+            except OSError:
+                pass
+        new_cache[filename] = {
+            "count": info["count"],
+            "content": info["content"],
+            "raw_url": raw_url,
+        }
+
+    # No await occurs in this function, so handlers observe either the old map
+    # or the complete new map, never a partially switched generation.
+    AGGREGATED_CACHE = new_cache
     AGGREGATED_CHUNKS = chunk_map
     AGGREGATED_PROTO_COUNTS = proto_counts_map
-    return results
+    removed = cleanup_stale_aggregate_chunks(
+        str(DATA_DIR),
+        list(chunk_map),
+        set(results),
+    )
+    if removed:
+        logger.info("Removed stale local chunks: %s", ", ".join(sorted(removed)))
+
 
 async def push_aggregated_to_github(aggregated_results):
     if not config.GITHUB_TOKEN or not config.GITHUB_REPO:
@@ -218,12 +446,12 @@ async def push_aggregated_to_github(aggregated_results):
             path = f"{config.GITHUB_SUB_PATH}/{filename}" if config.GITHUB_SUB_PATH else filename
             path = path.lstrip("/")
             to_push[path] = info["content"]
-        raw_map = await push_aggregated_subscriptions(to_push, config.GITHUB_REPO, config.GITHUB_TOKEN, config.GITHUB_BRANCH)
-        for path, raw_url in raw_map.items():
-            fname = path.split("/")[-1]
-            if fname in aggregated_results:
-                AGGREGATED_CACHE[fname] = {"raw_url": raw_url, "count": aggregated_results[fname]["count"], "content": aggregated_results[fname]["content"]}
-        return raw_map
+        return await push_aggregated_subscriptions(
+            to_push,
+            config.GITHUB_REPO,
+            config.GITHUB_TOKEN,
+            config.GITHUB_BRANCH,
+        )
     except Exception as e:
         logger.error(f"push error: {e}")
         return {}
@@ -250,6 +478,12 @@ async def notify_channel_update(bot, old_total, new_total):
         logger.warning(f"Channel notify failed: {e}")
 
 async def update_cache(categories=None, mode=None, bot=None):
+    """Serialize refreshes so cache, files, and rendered chunk buttons agree."""
+    async with UPDATE_LOCK:
+        return await _update_cache(categories=categories, mode=mode, bot=bot)
+
+
+async def _update_cache(categories=None, mode=None, bot=None):
     global CACHE, LAST_UPDATE
     mode = mode or config.CHECK_MODE
     if categories is None:
@@ -292,14 +526,13 @@ async def update_cache(categories=None, mode=None, bot=None):
     LAST_UPDATE = datetime.now(MSK)
     new_total = sum(len(v.get("configs", [])) for v in CACHE.values())
     try:
-        agg = build_aggregated_configs()
-        for fname, info in agg.items():
-            if fname not in AGGREGATED_CACHE:
-                AGGREGATED_CACHE[fname] = {"count": info["count"], "content": info["content"], "raw_url": get_raw_url(fname)}
-            else:
-                AGGREGATED_CACHE[fname].update({"count": info["count"], "content": info["content"]})
+        agg, chunk_map, proto_counts_map = build_aggregated_configs()
+        raw_map = {}
         if config.GITHUB_TOKEN and agg:
-            asyncio.create_task(push_aggregated_to_github(agg))
+            # Keep the previous keyboard generation active until all new files
+            # become visible together in one GitHub ref update.
+            raw_map = await push_aggregated_to_github(agg)
+        activate_aggregated_configs(agg, chunk_map, proto_counts_map, raw_map)
         # Уведомление в канал раз в час, если есть изменения
         if bot and old_total != new_total:
             asyncio.create_task(notify_channel_update(bot, old_total, new_total))
@@ -308,23 +541,24 @@ async def update_cache(categories=None, mode=None, bot=None):
     return result
 
 def get_raw_url(filename: str) -> str:
-    """Только .txt списки которые лежат на репозитории vless-parser-bot, без доменов"""
-    cached = AGGREGATED_CACHE.get(filename, {})
-    if cached.get("raw_url"):
-        return cached["raw_url"]
-    repo = "xznexil3/vless-parser-bot"
-    branch = "main"
-    return f"https://raw.githubusercontent.com/{repo}/{branch}/{filename}"
+    """Return a verified runtime/published URL, or an empty string."""
+    if config.PUBLIC_URL:
+        return f"{config.PUBLIC_URL}/sub/{filename}"
+    return AGGREGATED_CACHE.get(filename, {}).get("raw_url", "")
 
-def get_public_url(filename: str) -> str:
-    # Исключаем все yourdomain, работаем только с .txt на репо
-    return ""
 
-def get_temp_raw_url(filename: str) -> str:
-    """Временный .txt на самом репо vless-parser-bot (без доменов), живет 3 часа"""
-    repo = "xznexil3/vless-parser-bot"
-    branch = "main"
-    return f"https://raw.githubusercontent.com/{repo}/{branch}/{filename}"
+def local_subscription_path(filename: str):
+    """Return an active generated file or, before preload, a bootstrap copy."""
+    _, aggregate = aggregate_for_filename(filename)
+    if aggregate and AGGREGATED_CACHE and filename not in AGGREGATED_CACHE:
+        # The name belongs to an old aggregate generation. Do not silently
+        # serve a stale committed chunk after the active map has switched.
+        return None
+    for path in (DATA_DIR / filename, Path(__file__).parent.parent / filename):
+        if path.is_file():
+            return path
+    return None
+
 
 # ---------- Media helpers — редактируем одно сообщение ----------
 
@@ -393,72 +627,6 @@ async def send_initial_banner(update: Update, banner_name: str, text: str, reply
             logger.error(f"send banner {banner_name} failed: {e}")
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
 
-# ---------- Temp files (3 часа) — только .txt на репо ----------
-
-async def delete_temp_file_from_github(filename: str):
-    try:
-        import aiohttp
-        token = config.GITHUB_TOKEN
-        if not token:
-            return
-        repo = "xznexil3/vless-parser-bot"
-        async with aiohttp.ClientSession() as session:
-            url = f"https://api.github.com/repos/{repo}/contents/{filename}"
-            headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
-            async with session.get(url, headers=headers) as resp:
-                if resp.status != 200:
-                    return
-                data = await resp.json()
-                sha = data.get("sha")
-            if not sha:
-                return
-            payload = {"message": f"delete temp {filename} after 3h", "sha": sha, "branch": "main"}
-            async with session.delete(url, headers=headers, json=payload) as resp:
-                if resp.status in (200, 204):
-                    logger.info(f"Deleted temp file {filename} from GitHub")
-                else:
-                    txt = await resp.text()
-                    logger.warning(f"Delete temp {filename} failed {resp.status}: {txt[:200]}")
-    except Exception as e:
-        logger.error(f"delete temp file error {filename}: {e}")
-
-async def notify_temp_deleted(bot, user_id: int, filename: str):
-    """Уведомление от бота что временный список удален"""
-    try:
-        text = (
-            f"<b>Временный файл удален</b>\n\n"
-            f"<code>{filename}</code>\n\n"
-            f"Срок жизни 3 часа истек.\n"
-            f"Собери новую подписку — «Собрать подписку»"
-        )
-        await bot.send_message(chat_id=user_id, text=text, parse_mode=ParseMode.HTML, reply_markup=main_keyboard(user_id))
-    except Exception as e:
-        logger.warning(f"notify temp deleted to {user_id} failed: {e}")
-
-async def schedule_temp_deletion(filename: str, user_id: int, bot, delay_seconds: int = 10800):
-    """Удаляет временный .txt через 3 часа и уведомляет пользователя"""
-    await asyncio.sleep(delay_seconds)
-    # Удаляем локально
-    try:
-        local_path = Path(__file__).parent.parent / filename
-        if local_path.exists():
-            local_path.unlink()
-            logger.info(f"Deleted local temp {filename}")
-        data_path = DATA_DIR / filename
-        if data_path.exists():
-            data_path.unlink()
-        b64_path = DATA_DIR / filename.replace(".txt", "_base64.txt")
-        if b64_path.exists():
-            b64_path.unlink()
-    except Exception as e:
-        logger.error(f"local delete temp failed {filename}: {e}")
-    # Удаляем из GitHub
-    await delete_temp_file_from_github(filename)
-    TEMP_FILES.pop(filename, None)
-    # Уведомляем пользователя
-    if bot and user_id:
-        await notify_temp_deleted(bot, user_id, filename)
-
 # ---------- Handlers ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -495,141 +663,89 @@ async def handle_main_menu_text(update: Update, context: ContextTypes.DEFAULT_TY
         return True
     return False
 
+async def show_outdated_file(query, fname: str, back_data: str = "home"):
+    _, aggregate = aggregate_for_filename(fname)
+    if aggregate:
+        base_filename = aggregate["filename"]
+        current_chunks = AGGREGATED_CHUNKS.get(base_filename, [])
+        text = (
+            f"<b>{fname} больше не существует</b>\n\n"
+            "Количество конфигураций изменилось, поэтому пакеты были пересобраны. "
+            "Выбери актуальный пакет ниже."
+        )
+        keyboard = (
+            chunks_keyboard(base_filename, current_chunks, back_data=back_data)
+            if current_chunks
+            else back_keyboard(back_data)
+        )
+    else:
+        text = "<b>Файл больше не существует</b>\n\nОткрой список заново."
+        keyboard = back_keyboard(back_data)
+    await edit_message_with_banner(query, "configs", text, keyboard)
+
+
 async def send_chunk_file(query, fname, back_data="home"):
-    path = DATA_DIR / fname
-    if not path.exists():
-        root_path = Path(__file__).parent.parent / fname
-        if root_path.exists():
-            path = root_path
-        else:
-            await query.message.reply_text("Файл не найден, обновляю…")
-            await update_cache(bot=query.get_bot() if hasattr(query, 'get_bot') else None)
-    if path.exists():
-        title = fname
-        for v in config.AGGREGATED_SUBS.values():
-            if v["filename"] == fname:
-                title = v["profile_title"]
-                break
-            if fname.startswith(v["filename"].replace(".txt","")):
-                title = f"{v['profile_title']} — {fname}"
-                break
-        cnt = AGGREGATED_CACHE.get(fname, {}).get("count", "?")
-        # Только .txt на репо, без доменов
-        raw = get_temp_raw_url(fname) if fname.startswith("TEMP_") else get_raw_url(fname)
-        text = f"<b>{title}</b>\n\n<code>{raw}</code>\n\nКонфигов: <b>{cnt}</b>"
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("«Скачать файл»", callback_data=f"rawfile:{fname}"), InlineKeyboardButton("«Копировать ссылку»", callback_data=f"rawcopy:{fname}")],
-            [InlineKeyboardButton("«Назад»", callback_data=back_data)]
-        ])
-        await edit_message_with_banner(query, "configs", text, kb)
-        try:
-            await query.message.reply_document(document=open(path, "rb"), filename=fname, caption=f"{title} • {cnt}")
-        except Exception as e:
-            logger.error(e)
+    path = local_subscription_path(fname)
+    if path is None:
+        await query.message.reply_text("Файл изменился, обновляю список пакетов…")
+        await update_cache(bot=query.get_bot() if hasattr(query, "get_bot") else None)
+        path = local_subscription_path(fname)
 
-async def handle_build_subscription(query, user_id):
-    try:
-        await query.message.edit_caption(caption="Собираю подписку из 100 VLESS, подожди 5 сек...", parse_mode=ParseMode.HTML)
-    except:
-        try:
-            await query.message.edit_text("Собираю подписку из 100 VLESS, подожди 5 сек...")
-        except:
-            pass
-
-    if not CACHE:
-        await update_cache(bot=query.get_bot() if hasattr(query, 'get_bot') else None)
-
-    all_configs = []
-    seen = set()
-    for k, v in CACHE.items():
-        for c in v.get("configs", []):
-            if not c.lower().startswith("vless://"):
-                continue
-            # проверка на нерабочие конфиги
-            ok, _ = is_valid_any(c)
-            if not ok:
-                continue
-            if c not in seen:
-                seen.add(c)
-                all_configs.append(c)
-
-    valid_configs = all_configs
-
-    if not valid_configs:
-        await edit_message_with_banner(query, "configs", "Не удалось найти VLESS. Попробуй обновить кэш.", InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
+    if path is None:
+        await show_outdated_file(query, fname, back_data)
         return
 
-    random.shuffle(valid_configs)
-    selected = valid_configs[:100] if len(valid_configs) >= 100 else valid_configs
-    title = "Free VPN • Crimson — Custom 100"
-    timestamp = datetime.now(MSK).strftime("%H%M")
-    filename = f"TEMP_100_{user_id}_{timestamp}.txt"
-
-    try:
-        # Сохраняем только .txt, без base64, в data и в корень репо для пуша
-        path_data, _, content, _ = save_aggregated_file(str(DATA_DIR), filename, title, selected)
-        root_path = Path(__file__).parent.parent / filename
-        root_path.write_text(content, encoding="utf-8")
-
-        raw_url = None
-        if config.GITHUB_TOKEN:
-            try:
-                from github_sync import push_aggregated_subscriptions
-                temp_repo = "xznexil3/vless-parser-bot"
-                raw_map = await push_aggregated_subscriptions({filename: content}, temp_repo, config.GITHUB_TOKEN, "main")
-                raw_url = raw_map.get(filename) or get_temp_raw_url(filename)
-            except Exception as e:
-                logger.error(f"push temp failed: {e}")
-                raw_url = get_temp_raw_url(filename)
-        else:
-            raw_url = get_temp_raw_url(filename)
-
-        TEMP_FILES[filename] = {
-            "user_id": user_id,
-            "created_at": datetime.now(MSK).isoformat(),
-            "expires_at": (datetime.now(MSK) + timedelta(hours=3)).isoformat()
-        }
-        # Планируем удаление через 3 часа с уведомлением
-        bot_instance = query.get_bot() if hasattr(query, 'get_bot') else None
-        # если bot не доступен через query, попробуем context bot позже — пока передаем bot из query
-        try:
-            b = query._bot if hasattr(query, '_bot') else None
-        except:
-            b = None
-        # используем bot_instance или b
-        actual_bot = bot_instance or b
-        # если не удалось получить, все равно планируем удаление без уведомления (фолбек)
-        if actual_bot:
-            asyncio.create_task(schedule_temp_deletion(filename, user_id, actual_bot, 10800))
-        else:
-            # создаем задачу которая попытается получить bot позже — пока без уведомления
-            asyncio.create_task(schedule_temp_deletion(filename, user_id, None, 10800))
-
-        AGGREGATED_CACHE[filename] = {"count": len(selected), "content": content, "raw_url": raw_url}
-
-        text = (
-            f"<b>Готово — {len(selected)} VLESS</b>\n\n"
-            f"<code>{raw_url}</code>\n\n"
-            f"Файл: <code>{filename}</code>\n"
-            f"<i>Живет 3 часа, потом удалится</i>"
+    _, aggregate = aggregate_for_filename(fname)
+    title = fname
+    if aggregate:
+        title = aggregate["profile_title"]
+        if aggregate["filename"] != fname:
+            title = f"{title} — {fname}"
+    cnt = AGGREGATED_CACHE.get(fname, {}).get("count", "?")
+    raw = get_raw_url(fname)
+    link_text = (
+        f"<code>{raw}</code>"
+        if raw
+        else "Публичная ссылка пока недоступна; файл можно скачать напрямую."
+    )
+    text = f"<b>{title}</b>\n\n{link_text}\n\nКонфигов: <b>{cnt}</b>"
+    actions = [
+        InlineKeyboardButton(
+            "«Скачать файл»",
+            callback_data=f"rawfile:{fname}",
+            style=KeyboardButtonStyle.SUCCESS,
         )
-
-        kb_rows = [
-            [InlineKeyboardButton("«Скопировать ссылку»", callback_data=f"rawcopy:{filename}")],
-            [InlineKeyboardButton("«Скачать файл»", callback_data=f"rawfile:{filename}"), InlineKeyboardButton("«QR»", callback_data=f"qrfile:{filename}")],
-            [InlineKeyboardButton("«Собрать еще раз»", callback_data="build_subscription"), InlineKeyboardButton("«Назад»", callback_data="home")]
+    ]
+    if raw:
+        actions.append(
+            InlineKeyboardButton(
+                "«Копировать ссылку»",
+                callback_data=f"rawcopy:{fname}",
+                style=KeyboardButtonStyle.PRIMARY,
+            )
+        )
+    kb = InlineKeyboardMarkup(
+        [
+            actions,
+            [
+                InlineKeyboardButton(
+                    "«Назад»",
+                    callback_data=back_data,
+                    style=KeyboardButtonStyle.PRIMARY,
+                )
+            ],
         ]
-
-        await edit_message_with_banner(query, "configs", text, InlineKeyboardMarkup(kb_rows))
-
-        try:
-            await query.message.reply_document(document=open(path_data, "rb"), filename=filename, caption=f"Custom 100 • {len(selected)} VLESS • живет 3ч")
-        except Exception as e:
-            logger.error(e)
-
-    except Exception as e:
-        logger.error(f"build custom error: {e}")
-        await edit_message_with_banner(query, "configs", f"Ошибка: {e}", InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
+    )
+    await edit_message_with_banner(query, "configs", text, kb)
+    try:
+        with open(path, "rb") as document:
+            await query.message.reply_document(
+                document=document,
+                filename=fname,
+                caption=f"{title} • {cnt}",
+            )
+    except Exception as exc:
+        logger.error("send chunk %s failed: %s", fname, exc)
 
 async def handle_admin_clean(query):
     try:
@@ -657,10 +773,24 @@ async def handle_admin_clean(query):
             query,
             "main",
             f"<b>Проверка не завершена</b>\n\nОшибка: <code>{str(exc)[:300]}</code>",
-            InlineKeyboardMarkup([
-                [InlineKeyboardButton("«Назад»", callback_data="admin_panel")],
-                [InlineKeyboardButton("«Главное меню»", callback_data="home")],
-            ]),
+            InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "«Назад»",
+                            callback_data="admin_panel",
+                            style=KeyboardButtonStyle.PRIMARY,
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "«Главное меню»",
+                            callback_data="home",
+                            style=KeyboardButtonStyle.PRIMARY,
+                        )
+                    ],
+                ]
+            ),
         )
         return
 
@@ -692,10 +822,29 @@ async def handle_admin_clean(query):
     if not details and not unavailable:
         report.extend(["", "Все конфигурации прошли проверку."])
 
-    await edit_message_with_banner(query, "main", "\n".join(report), InlineKeyboardMarkup([
-        [InlineKeyboardButton("«Назад»", callback_data="admin_panel")],
-        [InlineKeyboardButton("«Главное меню»", callback_data="home")]
-    ]))
+    await edit_message_with_banner(
+        query,
+        "main",
+        "\n".join(report),
+        InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "«Назад»",
+                        callback_data="admin_panel",
+                        style=KeyboardButtonStyle.PRIMARY,
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "«Главное меню»",
+                        callback_data="home",
+                        style=KeyboardButtonStyle.PRIMARY,
+                    )
+                ],
+            ]
+        ),
+    )
 
 # ---------- Callback ----------
 
@@ -756,11 +905,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Caste: {caste}\n\n"
             f"Дата регистрации\n{reg_date}"
         )
-        await edit_message_with_banner(query, "profile", text, InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
+        await edit_message_with_banner(query, "profile", text, back_keyboard())
         return
 
     if data == "help":
-        await edit_message_with_banner(query, "help", config.HELP_TEXT, InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
+        await edit_message_with_banner(query, "help", config.HELP_TEXT, back_keyboard())
         return
 
     if data == "admin_panel":
@@ -775,7 +924,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Только для админа", show_alert=True)
             return
         if data == "admin_sources":
-            await query.message.reply_text(config.SOURCES_TEXT, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="admin_panel")]]))
+            await query.message.reply_text(
+                config.SOURCES_TEXT,
+                parse_mode=ParseMode.HTML,
+                reply_markup=back_keyboard("admin_panel"),
+            )
             return
         if data == "admin_stats":
             if not CACHE:
@@ -786,7 +939,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cnt=len(d.get("configs",[])); total+=cnt
                 lines.append(f"{k}: <b>{cnt}</b>")
             lines.append(f"\nВсего VLESS: <b>{total}</b>")
-            await query.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="admin_panel")]]))
+            await query.message.reply_text(
+                "\n".join(lines),
+                parse_mode=ParseMode.HTML,
+                reply_markup=back_keyboard("admin_panel"),
+            )
             return
         if data == "admin_refresh":
             try:
@@ -852,56 +1009,116 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         back_target = agg_key.lower().replace("_full","")
         if back_target not in ("white","black","full"):
             back_target = "home"
-        text = f"<b>{base_title}</b>\n\n<code>{raw}</code>\n\nКонфигов: <b>{cnt}</b>\n\nВыбери пакет:"
+        link_text = (
+            f"<code>{raw}</code>"
+            if raw
+            else "Публичная ссылка пока недоступна; пакеты можно скачать напрямую."
+        )
+        text = f"<b>{base_title}</b>\n\n{link_text}\n\nКонфигов: <b>{cnt}</b>\n\nВыбери пакет:"
         if chunks:
             kb = chunks_keyboard(fname, chunks, back_data=back_target, back_label="«К протоколам»")
         else:
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("«Скачать файл»", callback_data=f"rawfile:{fname}"), InlineKeyboardButton("«Копировать»", callback_data=f"rawcopy:{fname}")],
-                [InlineKeyboardButton("«К протоколам»", callback_data=back_target)]
-            ])
-            text = f"<b>{base_title}</b>\n\n<code>{raw}</code>\n\nКонфигов: <b>{cnt}</b>"
+            actions = [
+                InlineKeyboardButton(
+                    "«Скачать файл»",
+                    callback_data=f"rawfile:{fname}",
+                    style=KeyboardButtonStyle.SUCCESS,
+                )
+            ]
+            if raw:
+                actions.append(
+                    InlineKeyboardButton(
+                        "«Копировать»",
+                        callback_data=f"rawcopy:{fname}",
+                        style=KeyboardButtonStyle.PRIMARY,
+                    )
+                )
+            kb = InlineKeyboardMarkup(
+                [
+                    actions,
+                    [
+                        InlineKeyboardButton(
+                            "«К протоколам»",
+                            callback_data=back_target,
+                            style=KeyboardButtonStyle.PRIMARY,
+                        )
+                    ],
+                ]
+            )
+            text = f"<b>{base_title}</b>\n\n{link_text}\n\nКонфигов: <b>{cnt}</b>"
         await edit_message_with_banner(query, "configs", text, kb)
         return
 
     if data.startswith("chunk:"):
-        fname = data.split(":",1)[1]
-        back = "home"
-        for agg_key, agg in config.AGGREGATED_SUBS.items():
-            if fname.startswith(agg["filename"].replace(".txt","")):
-                bk = agg_key.lower().replace("_full","")
-                if bk in ("white","black","full"):
-                    back = bk
-        await send_chunk_file(query, fname, back_data=back)
+        fname = data.split(":", 1)[1]
+        await send_chunk_file(
+            query,
+            fname,
+            back_data=aggregate_back_callback(fname),
+        )
         return
 
     if data.startswith("rawcopy:"):
-        fname = data.split(":",1)[1]
-        raw = get_temp_raw_url(fname) if fname.startswith("TEMP_") else get_raw_url(fname)
-        await query.message.reply_text(f"<code>{raw}</code>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
+        fname = data.split(":", 1)[1]
+        if local_subscription_path(fname) is None:
+            await update_cache(bot=context.bot)
+        if local_subscription_path(fname) is None:
+            await show_outdated_file(query, fname, aggregate_back_callback(fname))
+            return
+        raw = get_raw_url(fname)
+        if not raw:
+            await query.message.reply_text(
+                "Публичная ссылка пока недоступна. Скачай файл напрямую.",
+                reply_markup=back_keyboard(aggregate_back_callback(fname)),
+            )
+            return
+        await query.message.reply_text(
+            f"<code>{raw}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_keyboard(aggregate_back_callback(fname)),
+        )
         return
 
     if data.startswith("b64copy:"):
-        fname = data.split(":",1)[1]
-        path = DATA_DIR / fname
-        if not path.exists():
-            path = Path(__file__).parent.parent / fname
-        if not path.exists():
-            await query.message.reply_text("Файл не найден")
+        fname = data.split(":", 1)[1]
+        path = local_subscription_path(fname)
+        if path is None:
+            await update_cache(bot=context.bot)
+            path = local_subscription_path(fname)
+        if path is None:
+            await show_outdated_file(query, fname, aggregate_back_callback(fname))
             return
-        content = path.read_text(encoding="utf-8")
-        b64 = base64.b64encode(content.encode('utf-8')).decode('utf-8')
-        if len(b64) < 4000:
-            await query.message.reply_text(f"<code>{b64}</code>", parse_mode=ParseMode.HTML)
+        content = path.read_bytes()
+        encoded = base64.b64encode(content)
+        if len(encoded) < 4000:
+            await query.message.reply_text(
+                f"<code>{encoded.decode('ascii')}</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=back_keyboard(aggregate_back_callback(fname)),
+            )
         else:
-            b64_path = DATA_DIR / f"{fname.replace('.txt','_base64.txt')}"
-            if b64_path.exists():
-                await query.message.reply_document(document=open(b64_path, "rb"), filename=b64_path.name)
+            document = BytesIO(encoded)
+            document.name = fname.replace(".txt", "_base64.txt")
+            await query.message.reply_document(
+                document=document,
+                filename=document.name,
+            )
         return
 
     if data.startswith("qrfile:"):
-        fname = data.split(":",1)[1]
-        link = get_temp_raw_url(fname) if fname.startswith("TEMP_") else get_raw_url(fname)
+        fname = data.split(":", 1)[1]
+        if local_subscription_path(fname) is None:
+            await update_cache(bot=context.bot)
+        if local_subscription_path(fname) is None:
+            await show_outdated_file(query, fname, aggregate_back_callback(fname))
+            return
+        link = get_raw_url(fname)
+        if not link:
+            await query.message.reply_text(
+                "QR недоступен, пока у файла нет публичной ссылки.",
+                reply_markup=back_keyboard(aggregate_back_callback(fname)),
+            )
+            return
         try:
             qr_bytes = generate_qr_bytes(link)
             await query.message.reply_photo(photo=qr_bytes, caption=f"{fname}\n{link}")
@@ -911,19 +1128,23 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("rawfile:"):
-        fname = data.split(":",1)[1]
-        path = DATA_DIR / fname
-        if not path.exists():
-            path = Path(__file__).parent.parent / fname
-        if not path.exists():
+        fname = data.split(":", 1)[1]
+        path = local_subscription_path(fname)
+        if path is None:
             await update_cache(bot=context.bot)
-            path = DATA_DIR / fname
-            if not path.exists():
-                path = Path(__file__).parent.parent / fname
-        if path.exists():
-            await query.message.reply_document(document=open(path, "rb"), filename=fname)
-        else:
-            await query.message.reply_text("Файл не найден")
+            path = local_subscription_path(fname)
+        if path is None:
+            await show_outdated_file(query, fname, aggregate_back_callback(fname))
+            return
+        try:
+            with open(path, "rb") as document:
+                await query.message.reply_document(document=document, filename=fname)
+        except Exception as exc:
+            logger.error("send subscription %s failed: %s", fname, exc)
+            await query.message.reply_text(
+                "Не удалось отправить файл. Открой список заново.",
+                reply_markup=back_keyboard(aggregate_back_callback(fname)),
+            )
         return
 
 # ---------- Message handlers ----------

@@ -1,9 +1,8 @@
 """
 Мини HTTP-сервер для отдачи подписок по ссылке.
-Поддерживает как стандартные категории, так и кастомные файлы типа CUSTOM_100_*.txt
+Поддерживает исходные категории и агрегированные VLESS-файлы.
 GET /sub/BLACK_FULL       -> plain агрегированная подписка
 GET /sub/BLACK_FULL/b64   -> base64
-GET /sub/CUSTOM_100_123.txt -> кастомная подписка (прямо по имени файла)
 GET /                    -> список всех подписок
 """
 import os
@@ -26,16 +25,7 @@ async def handle_list(request):
         fname = agg["filename"]
         html.append(f"<li><b>{agg['profile_title']}</b> — {fname} <a href='/sub/{fname}'>/sub/{fname}</a></li>")
     html.append("</ul>")
-    # Кастомные файлы из data/
-    html.append("<hr><h3>Кастомные (CUSTOM_100)</h3><ul>")
-    try:
-        for p in sorted(DATA_DIR.glob("CUSTOM_100*.txt")):
-            if "_base64" in p.name:
-                continue
-            html.append(f"<li><a href='/sub/{p.name}'>{p.name}</a> — <a href='/sub/{p.name}/b64'>base64</a></li>")
-    except:
-        pass
-    html.append(f"</ul><p>Добавь ссылку в клиент как подписку. Обновляется каждые {config.UPDATE_INTERVAL} мин.</p>")
+    html.append(f"<p>Добавь ссылку в клиент как подписку. Обновляется каждые {config.UPDATE_INTERVAL} мин.</p>")
     return web.Response(text="".join(html), content_type="text/html")
 
 async def handle_sub(request):
@@ -43,7 +33,7 @@ async def handle_sub(request):
     b64 = request.match_info.get("b64", "")
     # Определяем имя файла
     filename = None
-    # 1) Если key — это точное имя файла типа CUSTOM_100_123.txt или FULL.txt
+    # 1) Если key — это точное имя файла, например FULL.txt
     if key.endswith(".txt"):
         filename = key
         # если запрошен b64 через /sub/file.txt/b64 — отдаем base64 версию
@@ -74,7 +64,6 @@ async def handle_sub(request):
                 if not filename:
                     # Если b64 суффикс передан как второй параметр
                     if b64 == "b64":
-                        # key может быть CUSTOM_100_123.txt, а b64 = b64
                         if key.endswith(".txt"):
                             filename = key.replace(".txt", "_base64.txt")
                         else:

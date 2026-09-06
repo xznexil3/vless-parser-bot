@@ -1,93 +1,189 @@
-import os
+"""Atomic publication of generated VLESS subscriptions to GitHub."""
+
+import asyncio
 import base64
-import aiohttp
+import hashlib
 import logging
+import re
+from pathlib import PurePosixPath
+from urllib.parse import quote
+
+import aiohttp
 
 logger = logging.getLogger(__name__)
+API_ROOT = "https://api.github.com"
+MANAGED_FILE_RE = re.compile(r"^(.+?)(?:_(\d+))?\.txt$")
 
-async def get_file_sha(session, repo, path, token, branch="main"):
-    """Получает sha файла если существует, иначе None"""
-    url = f"https://api.github.com/repos/{repo}/contents/{path}"
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github.v3+json",
-        "User-Agent": "VLESS-Parser-Bot"
+
+def _headers(token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "VLESS-Parser-Bot",
     }
-    params = {"ref": branch}
-    try:
-        async with session.get(url, headers=headers, params=params) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                return data.get("sha")
-            elif resp.status == 404:
-                return None
-            else:
-                txt = await resp.text()
-                logger.warning(f"get sha {path} -> {resp.status}: {txt[:200]}")
-                return None
-    except Exception as e:
-        logger.error(f"get sha error: {e}")
-        return None
 
-async def push_file_to_github(repo, path, content_str, token, branch="main", message=None, retries=2):
-    """
-    Заливает файл в GitHub через API. Content_str - обычный текст, внутри закодируем в base64.
-    Возвращает raw_url или None. При 409 пробует перечитать sha и повторить.
+
+async def _response_json(response, operation: str, expected=(200,)):
+    if response.status not in expected:
+        body = await response.text()
+        raise RuntimeError(f"GitHub {operation} -> {response.status}: {body[:300]}")
+    return await response.json()
+
+
+def _git_blob_sha(content: bytes) -> str:
+    header = f"blob {len(content)}\0".encode("ascii")
+    return hashlib.sha1(header + content).hexdigest()
+
+
+def _managed_groups(paths: set) -> set:
+    """Return (directory, aggregate base name) pairs from the outgoing files."""
+    groups = set()
+    for path in paths:
+        item = PurePosixPath(path)
+        match = MANAGED_FILE_RE.fullmatch(item.name)
+        if not match:
+            continue
+        groups.add((str(item.parent) if str(item.parent) != "." else "", match.group(1)))
+    return groups
+
+
+def _is_managed_path(path: str, groups: set) -> bool:
+    item = PurePosixPath(path)
+    directory = str(item.parent) if str(item.parent) != "." else ""
+    match = MANAGED_FILE_RE.fullmatch(item.name)
+    return bool(match and (directory, match.group(1)) in groups)
+
+
+async def push_aggregated_subscriptions(
+    aggregated_files: dict,
+    repo: str,
+    token: str,
+    branch: str = "main",
+    retries: int = 2,
+):
+    """Publish every aggregate/chunk and delete stale chunks in one commit.
+
+    A single ref update prevents Railway from redeploying halfway through a
+    multi-file refresh, which previously allowed keyboards to reference files
+    (for example ``BLACK_FULL_6.txt``) that had not been uploaded yet.
     """
     if not token:
-        logger.warning("GITHUB_TOKEN не задан, пропуск push")
-        return None
-    if not repo or "/" not in repo:
-        logger.warning(f"Неверный repo: {repo}")
-        return None
+        logger.warning("GITHUB_TOKEN не задан, пропуск публикации")
+        return {}
+    if not repo or "/" not in repo or not aggregated_files:
+        logger.warning("Неверные параметры публикации GitHub")
+        return {}
+
+    outgoing = {
+        str(PurePosixPath(path)): content.encode("utf-8")
+        for path, content in aggregated_files.items()
+    }
+    outgoing_paths = set(outgoing)
+    managed_groups = _managed_groups(outgoing_paths)
+    encoded_branch = quote(branch, safe="")
+    headers = _headers(token)
+    timeout = aiohttp.ClientTimeout(total=120, connect=15, sock_read=60)
 
     for attempt in range(retries + 1):
-        async with aiohttp.ClientSession() as session:
-            sha = await get_file_sha(session, repo, path, token, branch)
-            url = f"https://api.github.com/repos/{repo}/contents/{path}"
-            headers = {
-                "Authorization": f"token {token}",
-                "Accept": "application/vnd.github.v3+json",
-                "User-Agent": "VLESS-Parser-Bot"
-            }
-            b64 = base64.b64encode(content_str.encode('utf-8')).decode('utf-8')
-            payload = {
-                "message": message or f"update {path}",
-                "content": b64,
-                "branch": branch,
-            }
-            if sha:
-                payload["sha"] = sha
+        try:
+            async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+                ref_url = f"{API_ROOT}/repos/{repo}/git/ref/heads/{encoded_branch}"
+                async with session.get(ref_url) as response:
+                    ref = await _response_json(response, "get ref")
+                parent_sha = ref["object"]["sha"]
 
-            async with session.put(url, headers=headers, json=payload) as resp:
-                txt = await resp.text()
-                if resp.status in (200, 201):
-                    logger.info(f"✅ GitHub push OK: {path} -> {resp.status} (attempt {attempt+1})")
-                    raw_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
-                    return raw_url
-                elif resp.status == 409 and attempt < retries:
-                    logger.warning(f"409 conflict {path}, retry {attempt+1}/{retries}...")
-                    import asyncio
-                    await asyncio.sleep(1)
-                    continue
-                else:
-                    logger.error(f"❌ GitHub push FAIL {path} -> {resp.status}: {txt[:500]}")
-                    return None
-    return None
+                commit_url = f"{API_ROOT}/repos/{repo}/git/commits/{parent_sha}"
+                async with session.get(commit_url) as response:
+                    parent_commit = await _response_json(response, "get commit")
+                base_tree_sha = parent_commit["tree"]["sha"]
 
-async def push_aggregated_subscriptions(aggregated_files: dict, repo, token, branch="main"):
-    """
-    aggregated_files: dict {path: content_str}
-    Заливает каждый и возвращает dict {path: raw_url}
-    """
-    results = {}
-    for path, content in aggregated_files.items():
-        # Делаем понятный коммит
-        lines = content.count("\n")
-        raw = await push_file_to_github(repo, path, content, token, branch, message=f"update {path} — {lines} lines")
-        if raw:
-            results[path] = raw
-        # Чтобы неупереться в rate limit, небольшая пауза
-        import asyncio
-        await asyncio.sleep(0.5)
-    return results
+                tree_url = f"{API_ROOT}/repos/{repo}/git/trees/{base_tree_sha}"
+                async with session.get(tree_url, params={"recursive": "1"}) as response:
+                    current_tree = await _response_json(response, "get tree")
+                current_blobs = {
+                    item["path"]: item["sha"]
+                    for item in current_tree.get("tree", [])
+                    if item.get("type") == "blob"
+                }
+
+                tree_entries = []
+                for path, content in outgoing.items():
+                    expected_sha = _git_blob_sha(content)
+                    if current_blobs.get(path) == expected_sha:
+                        continue
+                    blob_payload = {
+                        "content": base64.b64encode(content).decode("ascii"),
+                        "encoding": "base64",
+                    }
+                    async with session.post(
+                        f"{API_ROOT}/repos/{repo}/git/blobs",
+                        json=blob_payload,
+                    ) as response:
+                        blob = await _response_json(response, f"create blob {path}", expected=(201,))
+                    tree_entries.append(
+                        {"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]}
+                    )
+
+                stale_paths = sorted(
+                    path
+                    for path in current_blobs
+                    if _is_managed_path(path, managed_groups) and path not in outgoing_paths
+                )
+                tree_entries.extend(
+                    {"path": path, "mode": "100644", "type": "blob", "sha": None}
+                    for path in stale_paths
+                )
+
+                if tree_entries:
+                    async with session.post(
+                        f"{API_ROOT}/repos/{repo}/git/trees",
+                        json={"base_tree": base_tree_sha, "tree": tree_entries},
+                    ) as response:
+                        new_tree = await _response_json(response, "create tree", expected=(201,))
+
+                    message = (
+                        f"update VLESS subscriptions — {len(outgoing_paths)} files"
+                        + (f", remove {len(stale_paths)} stale chunks" if stale_paths else "")
+                    )
+                    async with session.post(
+                        f"{API_ROOT}/repos/{repo}/git/commits",
+                        json={
+                            "message": message,
+                            "tree": new_tree["sha"],
+                            "parents": [parent_sha],
+                        },
+                    ) as response:
+                        new_commit = await _response_json(response, "create commit", expected=(201,))
+
+                    async with session.patch(
+                        f"{API_ROOT}/repos/{repo}/git/refs/heads/{encoded_branch}",
+                        json={"sha": new_commit["sha"], "force": False},
+                    ) as response:
+                        if response.status == 422 and attempt < retries:
+                            logger.warning("GitHub branch changed during sync, retrying")
+                            await asyncio.sleep(1)
+                            continue
+                        await _response_json(response, "update ref")
+                    logger.info(
+                        "GitHub atomic sync: %s files, %s stale chunks removed",
+                        len(outgoing_paths),
+                        len(stale_paths),
+                    )
+
+                return {
+                    path: (
+                        f"https://raw.githubusercontent.com/{repo}/{branch}/"
+                        f"{quote(path, safe='/')}"
+                    )
+                    for path in outgoing_paths
+                }
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError, KeyError) as exc:
+            if attempt < retries:
+                logger.warning("GitHub atomic sync failed, retrying: %s", exc)
+                await asyncio.sleep(1)
+                continue
+            logger.error("GitHub atomic sync failed: %s", exc)
+            return {}
+
+    return {}

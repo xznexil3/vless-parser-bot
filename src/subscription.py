@@ -51,9 +51,11 @@ def save_subscription_files(base_dir: str, category_key: str, configs: list, pro
     plain_content = make_subscription_content(configs, header)
     b64_content = base64.b64encode(plain_content.encode('utf-8')).decode('utf-8')
     plain_path = os.path.join(base_dir, f"{category_key}.txt")
-    # base64 больше не создаем на диске, только .txt
-    with open(plain_path, "w", encoding="utf-8") as f:
+    # Atomic replacement prevents readers from observing a half-written feed.
+    temp_path = f"{plain_path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
         f.write(plain_content)
+    os.replace(temp_path, plain_path)
     b64_path = os.path.join(base_dir, f"{category_key}_base64.txt")
     # не пишем base64 файл, возвращаем путь для совместимости
     return plain_path, b64_path, plain_content, b64_content
@@ -63,8 +65,10 @@ def save_aggregated_file(base_dir: str, filename: str, profile_title: str, confi
     os.makedirs(base_dir, exist_ok=True)
     content = generate_aggregated_content(profile_title, configs)
     path = os.path.join(base_dir, filename)
-    with open(path, "w", encoding="utf-8") as f:
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
         f.write(content)
+    os.replace(temp_path, path)
     b64_path = os.path.join(base_dir, filename.replace(".txt", "_base64.txt"))
     b64 = base64.b64encode(content.encode('utf-8')).decode('utf-8')
     # base64 файл не создаем физически, только .txt
@@ -90,28 +94,53 @@ def chunk_configs(configs: list, size: int = CHUNK_SIZE):
     for i in range(0, len(configs), size):
         yield configs[i:i+size]
 
-def save_aggregated_chunks(base_dir: str, filename: str, profile_title: str, configs: list, chunk_size: int = CHUNK_SIZE):
-    """Делит configs по chunk_size и сохраняет FULL.txt, FULL_1.txt, FULL_2.txt ... Все в стиле Crimson."""
+def save_aggregated_chunks(
+    base_dir: str,
+    filename: str,
+    profile_title: str,
+    configs: list,
+    chunk_size: int = CHUNK_SIZE,
+):
+    """Write an aggregate and its numbered chunks without deleting old files.
+
+    Obsolete chunks are removed only after all new aggregates are generated and
+    the in-memory keyboard map is switched. This prevents a button from briefly
+    pointing at a chunk that was already deleted during a concurrent refresh.
+    """
     os.makedirs(base_dir, exist_ok=True)
     base_name = filename.replace(".txt", "")
-    # A smaller refresh must not leave obsolete numbered chunks on disk.
-    chunk_pattern = re.compile(rf"^{re.escape(base_name)}_\d+\.txt$")
-    for existing in os.listdir(base_dir):
-        if chunk_pattern.fullmatch(existing):
-            try:
-                os.remove(os.path.join(base_dir, existing))
-            except OSError:
-                pass
-    # Сначала сохраняем полный (для совместимости)
-    full_path, full_b64, full_content, full_b64c = save_aggregated_file(base_dir, filename, profile_title, configs)
-    chunks = list(chunk_configs(configs, chunk_size))
+    full_path, full_b64, full_content, full_b64c = save_aggregated_file(
+        base_dir, filename, profile_title, configs
+    )
     chunk_infos = []
-    for idx, chunk in enumerate(chunks, 1):
+    for idx, chunk in enumerate(chunk_configs(configs, chunk_size), 1):
         chunk_title = f"{profile_title} — {idx}"
         chunk_filename = f"{base_name}_{idx}.txt"
-        chunk_path, chunk_b64_path, chunk_content, chunk_b64 = save_aggregated_file(base_dir, chunk_filename, chunk_title, chunk)
+        _, _, chunk_content, _ = save_aggregated_file(
+            base_dir, chunk_filename, chunk_title, chunk
+        )
         chunk_infos.append((chunk_filename, chunk_title, len(chunk), chunk_content))
-    return (full_path, full_b64, full_content, full_b64c, chunk_infos)
+    return full_path, full_b64, full_content, full_b64c, chunk_infos
+
+
+def cleanup_stale_aggregate_chunks(
+    base_dir: str,
+    aggregate_filenames: list,
+    active_filenames: set,
+) -> list:
+    """Delete numbered aggregate chunks that are no longer in the active map."""
+    removed = []
+    for filename in aggregate_filenames:
+        base_name = filename.removesuffix(".txt")
+        chunk_pattern = re.compile(rf"^{re.escape(base_name)}_\d+\.txt$")
+        for existing in os.listdir(base_dir):
+            if chunk_pattern.fullmatch(existing) and existing not in active_filenames:
+                try:
+                    os.remove(os.path.join(base_dir, existing))
+                    removed.append(existing)
+                except OSError:
+                    pass
+    return removed
 
 def generate_qr_bytes(text: str) -> bytes:
     qr = qrcode.QRCode(version=1, box_size=8, border=2)

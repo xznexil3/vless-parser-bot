@@ -64,13 +64,16 @@ TCP-проверка подтверждает доступность endpoint-а
 
 ## ✨ Возможности
 
-- интерактивное Telegram-меню;
+- интерактивное Telegram-меню с цветными inline-кнопками Bot API 9.4;
+- семантические цвета: синий для навигации, зелёный для списков/скачивания, красный для помощи, админки и очистки;
 - отдельные `WHITE_FULL.txt`, `BLACK_FULL.txt` и `FULL.txt`;
 - plain-файлы, base64-представление, chunks и QR-коды;
 - автообновление с настраиваемым интервалом;
-- публикация агрегатов через GitHub Contents API;
+- атомарная публикация всех агрегатов в GitHub одним commit с удалением устаревших chunks;
+- синхронизированная смена карты кнопок и файлов без ссылок на отсутствующие пакеты;
+- обработка старых кнопок вроде `BLACK_FULL_6.txt` с переходом к актуальным пакетам;
 - ручная строгая проверка одного вставленного VLESS URI;
-- HTTP endpoint для выдачи сформированных подписок.
+- Railway HTTP endpoint `/sub/<file>.txt` и `/sub/<file>.txt/b64` для runtime-подписок.
 
 ## 🚀 Запуск
 
@@ -92,6 +95,8 @@ pip install -r requirements.txt
 python src/bot.py
 ```
 
+Проект использует `python-telegram-bot 22.8`, поскольку поддержка `style` и `icon_custom_emoji_id` для кнопок появилась в ветке 22.7+.
+
 ### 3. Docker
 
 ```bash
@@ -112,6 +117,8 @@ docker logs -f vless-parser-bot
 | `GITHUB_TOKEN` | Токен для публикации агрегатов | — |
 | `GITHUB_REPO` | Репозиторий агрегатов | `xznexil3/vless-parser-bot` |
 | `GITHUB_BRANCH` | Ветка публикации | `main` |
+| `PUBLIC_URL` | Публичный адрес runtime-подписок без завершающего `/` | определяется через Railway |
+| `RAILWAY_PUBLIC_DOMAIN` | Railway domain; автоматически превращается в `PUBLIC_URL` | Railway variable |
 | `PORT` | Порт health/subscription HTTP-сервера | `8080` |
 
 ## 🧠 Pipeline
@@ -135,7 +142,7 @@ python -m unittest discover -s tests -v
 python -m py_compile src/*.py tests/*.py
 ```
 
-Тесты покрывают plain/base64/escaped extraction, VLESS/Reality validation, private host rejection, normalized deduplication, mirror fallback, endpoint check deduplication, 11 обязательных провайдеров и точный текст кнопки администратора.
+Тесты покрывают plain/base64/escaped extraction, VLESS/Reality validation, private host rejection, normalized deduplication, mirror fallback, endpoint check deduplication, 11 обязательных провайдеров, цветовые стили кнопок, runtime HTTP-подписки и очистку устаревших chunks.
 
 ## 📂 Структура
 
@@ -145,8 +152,9 @@ vless-parser-bot/
 │   ├── bot.py          # Telegram-бот и admin cleanup
 │   ├── config.py       # источники, зеркала и агрегаты
 │   ├── parser.py       # fetch/extract/validate/dedup/TCP
-│   ├── subscription.py # plain/base64/chunk/QR
-│   └── server.py       # HTTP endpoint
+│   ├── subscription.py # atomic plain/base64/chunk generation
+│   ├── health.py       # Railway health + runtime subscriptions
+│   └── server.py       # standalone HTTP endpoint
 ├── tests/
 │   └── test_parser.py
 ├── data/               # runtime-файлы
