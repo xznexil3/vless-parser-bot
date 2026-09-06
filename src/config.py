@@ -27,34 +27,30 @@ GITHUB_SUB_PATH = os.getenv("GITHUB_SUB_PATH", "")
 def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
-# === Premium эмодзи (custom_emoji) — для @wtfparsbot ===
-# Бот может отправлять их бесплатно, но анимация покажется только если у бота куплен collectible username на Fragment.
-# До покупки — показывается fallback Unicode внутри тега, всё работает без падений.
-# ID проверены через getCustomEmojiStickers (200 OK)
+# === Premium эмодзи — оставлены для совместимости, но не используются (убраны смайлики по ТЗ) ===
 PREMIUM = {
-    "fire_crimson": '<tg-emoji emoji-id="5987683322615041517">🔥</tg-emoji>',  # CrimsonEmoji — фирменный огонь Crimson
-    "fire": '<tg-emoji emoji-id="5424972470023104089">🔥</tg-emoji>',  # NewsEmoji
-    "rocket": '<tg-emoji emoji-id="5445284980978621387">🚀</tg-emoji>',  # RestrictedEmoji
-    "sparkles": '<tg-emoji emoji-id="5325547803936572038">✨</tg-emoji>',
-    "diamond": '<tg-emoji emoji-id="5427168083074628963">💎</tg-emoji>',
-    "shield": '<tg-emoji emoji-id="5251203410396458957">🛡</tg-emoji>',
-    "lightning": '<tg-emoji emoji-id="5456140674028019486">⚡️</tg-emoji>',
-    "ghost": '<tg-emoji emoji-id="5371017798065592581">👻</tg-emoji>',
-    "heart": '<tg-emoji emoji-id="5377860677400536988">❤️</tg-emoji>',
-    "black_heart": '<tg-emoji emoji-id="5449692618151695997">🖤</tg-emoji>',
-    "thumbsup": '<tg-emoji emoji-id="5368324170671202286">👍</tg-emoji>',
-    "warning": '<tg-emoji emoji-id="5420323339723881652">⚠️</tg-emoji>',
-    "cross": '<tg-emoji emoji-id="5210952531676504517">❌</tg-emoji>',
-    "computer": '<tg-emoji emoji-id="5877565553761062314">💻</tg-emoji>',
-    "crystal": '<tg-emoji emoji-id="5471952986970267163">💎</tg-emoji>',  # Restricted diamond
+    "fire_crimson": "",
+    "fire": "",
+    "rocket": "",
+    "sparkles": "",
+    "diamond": "",
+    "shield": "",
+    "lightning": "",
+    "ghost": "",
+    "heart": "",
+    "black_heart": "",
+    "thumbsup": "",
+    "warning": "",
+    "cross": "",
+    "computer": "",
+    "crystal": "",
 }
 
 def pe(name: str, fallback: str = "") -> str:
-    """Быстрый доступ к premium emoji с fallback"""
-    return PREMIUM.get(name) or fallback
+    """Быстрый доступ к premium emoji с fallback — теперь возвращает пусто"""
+    return ""
 
 # === Источники ===
-# igareck — база, + дополнительные подписки против БС
 SOURCES = {
     "black_all": {
         "name": "Чёрные списки — VLESS",
@@ -105,7 +101,6 @@ SOURCES = {
             "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_SS+All_RUS.txt",
         ],
     },
-    # === Дополнительные подписки против БС (по твоему списку) ===
     "extra_zieng2": {
         "name": "Подписка от zieng2",
         "description": "Белые списки от zieng2",
@@ -145,18 +140,15 @@ SOURCES = {
     },
     "extra_cid": {
         "name": "CID VPN",
-        "description": "Подписка CID VPN — placeholder, замени url если есть актуальный",
+        "description": "Подписка CID VPN",
         "urls": [
-            # TODO: вставь актуальный raw url CID VPN, если есть
-            # "https://raw.githubusercontent.com/.../cid.txt",
             "https://raw.githubusercontent.com/Hidashimora/free-vpn-anti-rkn/main/configs/1.1.txt",
         ],
     },
     "extra_wrtrmmu": {
         "name": "Подписка от wrtrmmu",
-        "description": "WARP / TURN VK Calls — placeholder",
+        "description": "WARP / TURN VK Calls",
         "urls": [
-            # TODO: вставь raw от wrtrmmu
             "https://raw.githubusercontent.com/Hidashimora/free-vpn-anti-rkn/main/configs/2.1.txt",
         ],
     },
@@ -171,7 +163,7 @@ SOURCES = {
     },
     "extra_bolt": {
         "name": "VPN bolt",
-        "description": "Подписка VPN bolt — placeholder",
+        "description": "Подписка VPN bolt",
         "urls": [
             "https://raw.githubusercontent.com/Hidashimora/free-vpn-anti-rkn/main/configs/3.1.txt",
         ],
@@ -180,7 +172,7 @@ SOURCES = {
         "name": "Сборник подписок против БС",
         "description": "Сборник: все белые + чёрные в одном месте",
         "urls": [
-            "https://raw.githubusercontent.com/VAL41K/bypass-rkn-blocks/main/README.md",  # парсер вытянет vless из описания, если будут
+            "https://raw.githubusercontent.com/VAL41K/bypass-rkn-blocks/main/README.md",
         ],
     },
     "universal": {
@@ -200,7 +192,6 @@ GROUPS = {
     "all": ["black_all", "black_mobile", "ss_black", "white_cidr_all", "white_cidr_checked", "white_mobile", "extra_zieng2", "extra_etoneya_white", "extra_bye2", "extra_etoneya_black"],
 }
 
-# Одна большая подписка = все спарсенные (белые + чёрные) вместе, но и раздельно
 AGGREGATED_SUBS = {
     "BLACK_FULL": {
         "filename": "BLACK_FULL.txt",
@@ -220,45 +211,51 @@ AGGREGATED_SUBS = {
         "source_keys": ["black_all", "black_mobile", "ss_black", "white_cidr_all", "white_cidr_checked", "white_mobile", "white_sni", "extra_zieng2", "extra_etoneya_white", "extra_bye2", "extra_etoneya_black", "extra_cid", "extra_wrtrmmu", "extra_vercel", "extra_bolt", "extra_sbornik"],
         "description": "Полный список — все белые и чёрные вместе",
     },
+    "CUSTOM_100": {
+        "filename": "CUSTOM_100.txt",
+        "profile_title": "Free VPN • Crimson — Custom 100",
+        "source_keys": [],
+        "description": "Кастомная подписка из 100 рабочих конфигов",
+    },
 }
 
-# Для совместимости старые ключи FULL/COMBINED/BLACK_FULL/WHITE_FULL пусть указывают на новые
-# COMBINED = FULL
 AGGREGATED_SUBS["COMBINED"] = AGGREGATED_SUBS["FULL"]
 
-WELCOME_TEXT = f"""{PREMIUM['fire_crimson']} <b>Free VPN • Crimson</b> — рабочие автообновляемые конфиги для вашего «суверенного» интернета.
+WELCOME_TEXT = """<b>Free VPN • Crimson</b> — рабочие автообновляемые конфиги для вашего интернета.
 
-{PREMIUM['black_heart']} Два режима:
-{PREMIUM['shield']} <b>Чёрные</b> — весь трафик через VPN
-{PREMIUM['ghost']} <b>Белые</b> — для жёстких ТСПУ, когда работает только VK / Яндекс
+Два режима:
+<b>Черные</b> — весь трафик через VPN
+<b>Белые</b> — для жестких ТСПУ, когда работает только VK / Яндекс
 
-{PREMIUM['sparkles']} Режимы протоколов внутри каждого списка:
-{PREMIUM['lightning']} <b>VLESS</b> · {PREMIUM['shield']} <b>Trojan</b> · {PREMIUM['ghost']} <b>Shadowsocks</b> · {PREMIUM['computer']} <b>VMess</b> · {PREMIUM['rocket']} <b>Hysteria2</b>
+Режимы протоколов внутри каждого списка:
+<b>VLESS</b> · <b>Trojan</b> · <b>Shadowsocks</b> · <b>VMess</b> · <b>Hysteria2</b>
 
-{PREMIUM['diamond']} Выбери кнопку:
+Выбери кнопку:
 • <b>Полный список</b> — одна большая ссылка (делим по 300)
-• <b>Белые / Чёрные</b> — выбери протокол, получи пакеты по 300
+• <b>Белые / Черные</b> — выбери протокол, получи пакеты по 300
+• <b>Собрать подписку</b> — 100 разных рабочих конфигов в одной ссылке
 """
 
-HELP_TEXT = f"""<b>{PREMIUM['fire_crimson']} Free VPN • Crimson — помощь</b> {PREMIUM['sparkles']}
+HELP_TEXT = """<b>Free VPN • Crimson — помощь</b>
 
 Нажми кнопку в меню:
 
-{PREMIUM['thumbsup']} <b>Мой профиль</b> — твой ID
-{PREMIUM['ghost']} <b>Белые списки</b> — для ТСПУ: выбор протокола → пакеты по 300 (VLESS/Trojan/SS/VMess/Hy2)
-{PREMIUM['shield']} <b>Чёрные списки</b> — классический VPN: выбор протокола → пакеты по 300
-{PREMIUM['diamond']} <b>Полный список</b> — всё вместе: выбор протокола → пакеты по 300
-{PREMIUM['computer']} <b>Помощь</b> — это окно
+<b>Мой профиль</b> — твой ID
+<b>Белые списки</b> — для ТСПУ: выбор протокола → пакеты по 300 (VLESS/Trojan/SS/VMess/Hy2)
+<b>Черные списки</b> — классический VPN: выбор протокола → пакеты по 300
+<b>Полный список</b> — всё вместе: выбор протокола → пакеты по 300
+<b>Собрать подписку</b> — бот соберет 100 разных рабочих конфигов и выдаст ссылку
+<b>Помощь</b> — это окно
 
-<b>{PREMIUM['rocket']} Протоколы (режимы):</b>
-• {PREMIUM['lightning']} <b>VLESS</b> — основной, Reality, работает везде
-• {PREMIUM['shield']} <b>Trojan</b> — для Sing-box / Clash
-• {PREMIUM['ghost']} <b>Shadowsocks</b> — SS
-• {PREMIUM['computer']} <b>VMess</b> — старый V2Ray
-• {PREMIUM['rocket']} <b>Hysteria2 / Hy2</b> — скоростной QUIC {PREMIUM['sparkles']}
+<b>Протоколы (режимы):</b>
+• <b>VLESS</b> — основной, Reality, работает везде
+• <b>Trojan</b> — для Sing-box / Clash
+• <b>Shadowsocks</b> — SS
+• <b>VMess</b> — старый V2Ray
+• <b>Hysteria2 / Hy2</b> — скоростной QUIC
 
-<b>{PREMIUM['diamond']} Как подключить:</b>
-1. Нажми <b>Белые / Чёрные / Полный</b> → выбери протокол → выбери пакет (1..N по 300)
+<b>Как подключить:</b>
+1. Нажми <b>Белые / Черные / Полный</b> → выбери протокол → выбери пакет (1..N по 300)
 2. Скопируй ссылку вида <code>https://raw.githubusercontent.com/.../FULL_VLESS_1.txt</code>
 3. Вставь как <b>URL подписки</b> в Happ / Streisand / v2rayNG / Hiddify / Throne / NekoBox
 4. Обнови подписку → выбери сервер → Connect
@@ -266,13 +263,13 @@ HELP_TEXT = f"""<b>{PREMIUM['fire_crimson']} Free VPN • Crimson — помощ
 Клиенты: <b>Happ, Streisand, v2rayNG, Hiddify, Throne, NekoRay, Karing, Exclave</b>
 Автообновление — раз в час. Все файлы по 300 для стабильной загрузки.
 
-{PREMIUM['heart']} Вопросы — @wtfparsbot {PREMIUM['black_heart']}
+Вопросы — @wtfparsbot
 """
 
-SOURCES_TEXT = f"""<b>{PREMIUM['diamond']} Free VPN • Crimson — источники</b> {PREMIUM['sparkles']}
+SOURCES_TEXT = """<b>Free VPN • Crimson — источники</b>
 Основное: igareck, zieng2, etoneya, ByeWhiteLists 2.0, CID, wrtrmmu, Vercel, VPN bolt + зеркала.
 Полный список зеркал — в конфиге бота (src/config.py → SOURCES).
 
-{PREMIUM['computer']} Авто-очистка: {PREMIUM['warning']} приватные IP, {PREMIUM['cross']} битые UUID/порт, дубликаты — удаляются.
-{PREMIUM['thumbsup']} Всё делится по протоколам и по 300.
+Авто-очистка: приватные IP, битые UUID/порт, дубликаты — удаляются.
+Всё делится по протоколам и по 300.
 """

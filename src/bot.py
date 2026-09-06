@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import random
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -9,8 +10,8 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 from telegram.constants import ParseMode
 
 import config
-from parser import fetch_all, is_valid_vless, parse_vless_info
-from subscription import save_subscription_files, generate_qr_bytes, get_subscription_stats, CHUNK_SIZE, save_aggregated_chunks, PROTOCOLS, PROTOCOL_LABELS, filter_by_protocol
+from parser import fetch_all, is_valid_vless, parse_vless_info, is_valid_any
+from subscription import save_subscription_files, generate_qr_bytes, get_subscription_stats, CHUNK_SIZE, save_aggregated_chunks, PROTOCOLS, PROTOCOL_LABELS, filter_by_protocol, save_aggregated_file
 import aiohttp
 try:
     from health import start_health_server
@@ -37,43 +38,45 @@ REPLY_MENU = ReplyKeyboardMarkup([[KeyboardButton("Главное меню")]], 
 
 def main_keyboard(user_id: int = None):
     kb = [
-        [InlineKeyboardButton("Мой профиль", callback_data="profile")],
-        [InlineKeyboardButton("Белые списки", callback_data="white"),
-         InlineKeyboardButton("Черные списки", callback_data="black")],
-        [InlineKeyboardButton("Полный список", callback_data="full")],
-        [InlineKeyboardButton("Помощь", callback_data="help")],
+        [InlineKeyboardButton("«Профиль»", callback_data="profile")],
+        [InlineKeyboardButton("«Белые списки»", callback_data="white"),
+         InlineKeyboardButton("«Черные списки»", callback_data="black")],
+        [InlineKeyboardButton("«Полный список»", callback_data="full")],
+        [InlineKeyboardButton("«Собрать подписку»", callback_data="build_subscription")],
+        [InlineKeyboardButton("«Помощь»", callback_data="help")],
     ]
     if user_id and config.is_admin(user_id):
-        kb.append([InlineKeyboardButton("Админ панель", callback_data="admin_panel")])
+        kb.append([InlineKeyboardButton("«Админ панель»", callback_data="admin_panel")])
     return InlineKeyboardMarkup(kb)
 
 def admin_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Статистика", callback_data="admin_stats"),
-         InlineKeyboardButton("Обновить кэш", callback_data="admin_refresh")],
-        [InlineKeyboardButton("Источники", callback_data="admin_sources")],
-        [InlineKeyboardButton("‹ Назад", callback_data="home")],
+        [InlineKeyboardButton("«Статистика»", callback_data="admin_stats"),
+         InlineKeyboardButton("«Обновить кэш»", callback_data="admin_refresh")],
+        [InlineKeyboardButton("«Очистить нерабочие»", callback_data="admin_clean")],
+        [InlineKeyboardButton("«Источники»", callback_data="admin_sources")],
+        [InlineKeyboardButton("«Назад»", callback_data="home")],
     ])
 
 def category_keyboard(category_key: str):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Получить файл", callback_data=f"file:{category_key}"),
-         InlineKeyboardButton("Копировать", callback_data=f"copy:{category_key}")],
-        [InlineKeyboardButton("Показать 5", callback_data=f"preview:{category_key}"),
-         InlineKeyboardButton("QR", callback_data=f"qr:{category_key}")],
-        [InlineKeyboardButton("‹ Назад", callback_data="home")],
+        [InlineKeyboardButton("«Получить файл»", callback_data=f"file:{category_key}"),
+         InlineKeyboardButton("«Копировать»", callback_data=f"copy:{category_key}")],
+        [InlineKeyboardButton("«Показать 5»", callback_data=f"preview:{category_key}"),
+         InlineKeyboardButton("«QR»", callback_data=f"qr:{category_key}")],
+        [InlineKeyboardButton("«Назад»", callback_data="home")],
     ])
 
-def chunks_keyboard(base_filename: str, chunk_list, back_data: str = "home", back_label: str = "‹ Назад"):
+def chunks_keyboard(base_filename: str, chunk_list, back_data: str = "home", back_label: str = "«Назад»"):
     rows = []
     for idx, (cfname, title, cnt) in enumerate(chunk_list, 1):
         short = cfname.replace(".txt","")
-        label = f"{short} · {cnt}"
+        label = f"«{short} · {cnt}»"
         if len(rows)==0 or len(rows[-1])==2:
             rows.append([InlineKeyboardButton(label, callback_data=f"chunk:{cfname}")])
         else:
             rows[-1].append(InlineKeyboardButton(label, callback_data=f"chunk:{cfname}"))
-    rows.append([InlineKeyboardButton("Скачать полный файл", callback_data=f"rawfile:{base_filename}")])
+    rows.append([InlineKeyboardButton(f"«Скачать полный файл»", callback_data=f"rawfile:{base_filename}")])
     rows.append([InlineKeyboardButton(back_label, callback_data=back_data)])
     return InlineKeyboardMarkup(rows)
 
@@ -81,26 +84,21 @@ def protocol_keyboard(agg_key: str):
     """Кнопки выбора протокола для agg_key: WHITE_FULL / BLACK_FULL / FULL"""
     agg = config.AGGREGATED_SUBS.get(agg_key)
     if not agg:
-        return InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="home")]])
+        return InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]])
     base = agg["filename"]
     total = AGGREGATED_CACHE.get(base, {}).get("count", "?")
     counts = AGGREGATED_PROTO_COUNTS.get(base, {})
     rows = []
-    # Все — первым отдельным рядом
-    rows.append([InlineKeyboardButton(f"🌐 Все · {total}", callback_data=f"proto:{agg_key}:all")])
-    # Протоколы — по 2 в ряд, показываем только те где >0, сортируем по убыванию количества
+    rows.append([InlineKeyboardButton(f"«Все · {total}»", callback_data=f"proto:{agg_key}:all")])
     available = [(p, counts.get(p, 0)) for p in PROTOCOLS if counts.get(p, 0) > 0]
-    # Сортировка: vless всегда первый (самый крупный), остальные по убыванию
-    # Но для стабильности — сначала vless, потом остальные по count desc
     if available:
-        # вынести vless вперёд если есть
         vless = [x for x in available if x[0]=="vless"]
         rest = [x for x in available if x[0]!="vless"]
         rest.sort(key=lambda x: x[1], reverse=True)
         ordered = vless + rest
         row = []
         for proto, cnt in ordered:
-            label = f"{PROTOCOL_LABELS.get(proto, proto.upper())} · {cnt}"
+            label = f"«{PROTOCOL_LABELS.get(proto, proto.upper())} · {cnt}»"
             btn = InlineKeyboardButton(label, callback_data=f"proto:{agg_key}:{proto}")
             row.append(btn)
             if len(row)==2:
@@ -108,10 +106,7 @@ def protocol_keyboard(agg_key: str):
                 row=[]
         if row:
             rows.append(row)
-    else:
-        # если ещё нет данных — показываем хотя бы VLESS
-        pass
-    rows.append([InlineKeyboardButton("‹ Назад", callback_data="home")])
+    rows.append([InlineKeyboardButton("«Назад»", callback_data="home")])
     return InlineKeyboardMarkup(rows)
 
 # ---------- Aggregated ----------
@@ -131,6 +126,9 @@ def build_aggregated_configs():
         source_keys = agg["source_keys"]
         all_cfgs = []
         seen = set()
+        # Если source_keys пустой (CUSTOM_100) — пропускаем, он создается отдельно
+        if agg_key == "CUSTOM_100" and not source_keys:
+            continue
         for sk in source_keys:
             data = CACHE.get(sk, {})
             for c in data.get("configs", []):
@@ -146,7 +144,6 @@ def build_aggregated_configs():
                 chunk_list.append((cfname, ctitle, cnt))
             chunk_map[filename] = chunk_list
             logger.info(f"Aggregated {filename}: {len(all_cfgs)} -> {len(chunk_infos)} чанков")
-            # --- Протокольные срезы ---
             base_name = filename.replace(".txt", "")
             proto_counts = {}
             for proto in PROTOCOLS:
@@ -242,7 +239,7 @@ def get_raw_url(filename: str) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else None
     await update.message.reply_text(
-        f"{config.PREMIUM['sparkles']} Клавиатура обновлена — жми «Главное меню» внизу {config.PREMIUM['thumbsup']}",
+        "Клавиатура обновлена — жми «Главное меню» внизу",
         reply_markup=REPLY_MENU
     )
     await update.message.reply_text(
@@ -271,15 +268,12 @@ async def send_chunk_file(query, fname, back_data="home"):
         await update_cache()
     if path.exists():
         title = fname
-        # try to resolve title from aggregated or proto files
         for v in config.AGGREGATED_SUBS.values():
             if v["filename"] == fname:
                 title = v["profile_title"]
                 break
             if fname.startswith(v["filename"].replace(".txt","")):
-                # e.g., BLACK_FULL_VLESS_1.txt -> title Black — VLESS — 1
                 base_title = v["profile_title"]
-                # detect proto in filename
                 for proto in PROTOCOLS:
                     if f"_{proto.upper()}.txt" in fname or f"_{proto.upper()}_" in fname:
                         base_title = f"{base_title} — {PROTOCOL_LABELS.get(proto, proto.upper())}"
@@ -288,12 +282,135 @@ async def send_chunk_file(query, fname, back_data="home"):
                 break
         cnt = AGGREGATED_CACHE.get(fname, {}).get("count", "?")
         raw = get_raw_url(fname)
-        await query.message.reply_text(f"{config.PREMIUM['diamond']} <b>{title}</b> {config.PREMIUM['sparkles']}\n<code>{raw}</code>\nКонфигов: <b>{cnt}</b> {config.PREMIUM['fire_crimson']}", parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Скачать файл", callback_data=f"rawfile:{fname}"), InlineKeyboardButton("Копировать ссылку", callback_data=f"rawcopy:{fname}")],[InlineKeyboardButton("‹ Назад", callback_data=back_data)]]))
+        await query.message.reply_text(f"<b>{title}</b>\n<code>{raw}</code>\nКонфигов: <b>{cnt}</b>", parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Скачать файл»", callback_data=f"rawfile:{fname}"), InlineKeyboardButton("«Копировать ссылку»", callback_data=f"rawcopy:{fname}")],[InlineKeyboardButton("«Назад»", callback_data=back_data)]]))
         try:
             await query.message.reply_document(document=open(path, "rb"), filename=fname, caption=f"{title} • {cnt}")
         except Exception as e:
             logger.error(e)
+
+async def handle_build_subscription(query, user_id):
+    await query.message.edit_text("Собираю подписку из 100 рабочих конфигов, подожди...")
+    if not CACHE:
+        await update_cache()
+    # Собираем все конфиги из кэша
+    all_configs = []
+    seen = set()
+    for k, v in CACHE.items():
+        for c in v.get("configs", []):
+            if c not in seen:
+                seen.add(c)
+                all_configs.append(c)
+    # Дополнительная валидация на рабочие (синтаксис)
+    valid_configs = []
+    for c in all_configs:
+        ok, _ = is_valid_any(c)
+        if ok:
+            valid_configs.append(c)
+    if not valid_configs:
+        await query.message.edit_text("Не удалось найти рабочие конфиги. Попробуй обновить кэш.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
+        return
+    random.shuffle(valid_configs)
+    need = 100
+    selected = valid_configs[:need] if len(valid_configs) >= need else valid_configs
+    # Сохраняем
+    title = "Free VPN • Crimson — Custom 100"
+    filename = "CUSTOM_100.txt"
+    user_filename = f"CUSTOM_100_{user_id}.txt"
+    try:
+        path, b64_path, content, b64 = save_aggregated_file(str(DATA_DIR), filename, title, selected)
+        path_user, _, _, _ = save_aggregated_file(str(DATA_DIR), user_filename, title, selected)
+        raw_url = get_raw_url(filename)
+        raw_url_user = get_raw_url(user_filename)
+        # Пуш в гитхаб если настроен
+        if config.GITHUB_TOKEN and config.GITHUB_REPO:
+            try:
+                from github_sync import push_aggregated_subscriptions
+                to_push = {}
+                p1 = f"{config.GITHUB_SUB_PATH}/{filename}" if config.GITHUB_SUB_PATH else filename
+                p2 = f"{config.GITHUB_SUB_PATH}/{user_filename}" if config.GITHUB_SUB_PATH else user_filename
+                to_push[p1.lstrip("/")] = content
+                to_push[p2.lstrip("/")] = content
+                raw_map = await push_aggregated_subscriptions(to_push, config.GITHUB_REPO, config.GITHUB_TOKEN, config.GITHUB_BRANCH)
+                for p, url in raw_map.items():
+                    if p.endswith(filename):
+                        raw_url = url
+                    if p.endswith(user_filename):
+                        raw_url_user = url
+            except Exception as e:
+                logger.error(f"push custom failed: {e}")
+        AGGREGATED_CACHE[filename] = {"count": len(selected), "content": content, "raw_url": raw_url}
+        AGGREGATED_CACHE[user_filename] = {"count": len(selected), "content": content, "raw_url": raw_url_user}
+
+        text = (
+            f"<b>Готово — собрано {len(selected)} конфигов</b>\n\n"
+            f"Ссылка на подписку:\n<code>{raw_url_user}</code>\n\n"
+            f"Общая ссылка (обновляется):\n<code>{raw_url}</code>\n\n"
+            f"Количество: <b>{len(selected)}</b>\n\n"
+            f"Добавь эту ссылку в Happ / Streisand / v2rayNG как URL подписки."
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("«Скопировать ссылку»", callback_data=f"rawcopy:{user_filename}"), InlineKeyboardButton("«Скачать файл»", callback_data=f"rawfile:{user_filename}")],
+            [InlineKeyboardButton("«Собрать еще раз»", callback_data="build_subscription")],
+            [InlineKeyboardButton("«Назад»", callback_data="home")]
+        ])
+        await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        try:
+            await query.message.reply_document(document=open(path_user, "rb"), filename=user_filename, caption=f"Custom 100 • {len(selected)} конфигов")
+        except Exception as e:
+            logger.error(e)
+    except Exception as e:
+        logger.error(f"build custom error: {e}")
+        await query.message.edit_text(f"Ошибка при сборке подписки: {e}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
+
+async def handle_admin_clean(query):
+    await query.message.edit_text("Запущена очистка нерабочих конфигов, подожди...")
+    total_before = 0
+    total_after = 0
+    details = []
+    for key, data in list(CACHE.items()):
+        configs = data.get("configs", [])
+        total_before += len(configs)
+        valid = []
+        for c in configs:
+            ok, _ = is_valid_any(c)
+            if ok:
+                valid.append(c)
+        # дедупликация
+        seen = set()
+        uniq_valid = []
+        for c in valid:
+            if c not in seen:
+                seen.add(c)
+                uniq_valid.append(c)
+        removed = len(configs) - len(uniq_valid)
+        if removed > 0:
+            details.append(f"{key}: удалено {removed}")
+        CACHE[key]["configs"] = uniq_valid
+        CACHE[key]["filtered_total"] = len(uniq_valid)
+        total_after += len(uniq_valid)
+    # Пересборка агрегированных
+    try:
+        agg = build_aggregated_configs()
+        for fname, info in agg.items():
+            AGGREGATED_CACHE[fname] = {"count": info["count"], "content": info["content"], "raw_url": get_raw_url(fname)}
+        if config.GITHUB_TOKEN and agg:
+            asyncio.create_task(push_aggregated_to_github(agg))
+    except Exception as e:
+        logger.error(f"rebuild after clean failed: {e}")
+
+    text = (
+        f"<b>Очистка завершена</b>\n\n"
+        f"Было: {total_before}\n"
+        f"Стало: {total_after}\n"
+        f"Удалено: {total_before - total_after}\n\n"
+        + ("\n".join(details[:30]) if details else "Все конфиги уже чистые")
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("«Назад»", callback_data="admin_panel")],
+        [InlineKeyboardButton("«Главное меню»", callback_data="home")]
+    ])
+    await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 # ---------- Callback ----------
 
@@ -310,56 +427,62 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "profile":
         user = query.from_user
         text = (
-            f"{config.PREMIUM['thumbsup']} <b>Мой профиль</b> {config.PREMIUM['sparkles']}\n\n"
-            f"{config.PREMIUM['computer']} ID: <code>{user.id}</code>\n"
+            f"<b>Мой профиль</b>\n\n"
+            f"ID: <code>{user.id}</code>\n"
             f"Username: @{user.username or '—'}\n"
-            f"{config.PREMIUM['heart']} Имя: {user.first_name or '—'}"
+            f"Имя: {user.first_name or '—'}"
         )
         await query.message.reply_text(text, parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="home")]]))
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
         return
 
     if data == "help":
         await query.message.reply_text(config.HELP_TEXT, parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="home")]]))
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
+        return
+
+    if data == "build_subscription":
+        await handle_build_subscription(query, uid)
         return
 
     if data == "admin_panel":
         if not config.is_admin(uid):
             await query.answer("Только для админа", show_alert=True)
             return
-        await query.message.edit_text(f"{config.PREMIUM['diamond']} <b>Админ панель</b> {config.PREMIUM['sparkles']}\nВыбери действие:", parse_mode=ParseMode.HTML, reply_markup=admin_keyboard())
+        await query.message.edit_text("<b>Админ панель</b>\nВыбери действие:", parse_mode=ParseMode.HTML, reply_markup=admin_keyboard())
         return
 
-    if data in ("admin_stats", "admin_refresh", "admin_sources"):
+    if data in ("admin_stats", "admin_refresh", "admin_sources", "admin_clean"):
         if not config.is_admin(uid):
             await query.answer("Только для админа", show_alert=True)
             return
         if data == "admin_sources":
             await query.message.reply_text(config.SOURCES_TEXT, parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="admin_panel")]]))
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="admin_panel")]]))
             return
         if data == "admin_stats":
             if not CACHE:
                 await update_cache()
-            lines = [f"{config.PREMIUM['computer']} <b>Статистика • {datetime.now(MSK).strftime('%d.%m %H:%M')}</b> {config.PREMIUM['sparkles']}"]
+            lines = [f"<b>Статистика • {datetime.now(MSK).strftime('%d.%m %H:%M')}</b>"]
             total=0
             for k,d in CACHE.items():
                 cnt=len(d.get("configs",[])); total+=cnt
                 lines.append(f"• {k}: <b>{cnt}</b>")
-            lines.append(f"\n{config.PREMIUM['fire_crimson']} Всего: <b>{total}</b> {config.PREMIUM['diamond']}")
+            lines.append(f"\nВсего: <b>{total}</b>")
             for fname, info in AGGREGATED_CACHE.items():
                 if info.get("is_chunk"):
                     continue
-                # show base + protocol files
-                lines.append(f"{config.PREMIUM['diamond']} • {fname}: <b>{info.get('count','?')}</b>")
+                lines.append(f"• {fname}: <b>{info.get('count','?')}</b>")
             await query.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="admin_panel")]]))
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="admin_panel")]]))
             return
         if data == "admin_refresh":
-            await query.message.edit_text(f"{config.PREMIUM['lightning']} Обновляю кэш… {config.PREMIUM['sparkles']}")
+            await query.message.edit_text("Обновляю кэш…")
             await update_cache()
-            await query.message.edit_text(f"{config.PREMIUM['thumbsup']} Готово • {datetime.now(MSK).strftime('%H:%M')} {config.PREMIUM['fire_crimson']}", reply_markup=admin_keyboard())
+            await query.message.edit_text(f"Готово • {datetime.now(MSK).strftime('%H:%M')}", reply_markup=admin_keyboard())
+            return
+        if data == "admin_clean":
+            await handle_admin_clean(query)
             return
 
     if data in ("sources", "stats", "refresh"):
@@ -373,7 +496,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await callback_handler(update, context)
         return
 
-    # --- Белые / Черные / Полный теперь показывают выбор протокола ---
     if data == "white":
         agg_key = "WHITE_FULL"
         agg = config.AGGREGATED_SUBS[agg_key]
@@ -382,9 +504,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update_cache()
         total = AGGREGATED_CACHE.get(base, {}).get("count", "?")
         text = (
-            f"{config.PREMIUM['ghost']} <b>Белые списки</b> — для жёстких ТСПУ (VK, Яндекс) {config.PREMIUM['sparkles']}\n"
-            f"Всего: <b>{total}</b> • делю по 300 {config.PREMIUM['diamond']}\n\n"
-            f"{config.PREMIUM['lightning']} Выбери протокол (режим):"
+            f"<b>Белые списки</b> — для жестких ТСПУ (VK, Яндекс)\n"
+            f"Всего: <b>{total}</b> • делю по 300\n\n"
+            f"Выбери протокол (режим):"
         )
         await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=protocol_keyboard(agg_key))
         return
@@ -397,9 +519,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update_cache()
         total = AGGREGATED_CACHE.get(base, {}).get("count", "?")
         text = (
-            f"{config.PREMIUM['shield']} <b>Чёрные списки</b> — весь трафик через VPN {config.PREMIUM['fire_crimson']}\n"
-            f"Всего: <b>{total}</b> • делю по 300 {config.PREMIUM['diamond']}\n\n"
-            f"{config.PREMIUM['lightning']} Выбери протокол (режим):"
+            f"<b>Черные списки</b> — весь трафик через VPN\n"
+            f"Всего: <b>{total}</b> • делю по 300\n\n"
+            f"Выбери протокол (режим):"
         )
         await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=protocol_keyboard(agg_key))
         return
@@ -412,16 +534,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update_cache()
         total = AGGREGATED_CACHE.get(base, {}).get("count", "?")
         text = (
-            f"{config.PREMIUM['diamond']} <b>Полный список</b> — все белые + чёрные {config.PREMIUM['sparkles']}\n"
-            f"Всего: <b>{total}</b> • делю по 300 {config.PREMIUM['fire_crimson']}\n\n"
-            f"{config.PREMIUM['lightning']} Выбери протокол (режим):"
+            f"<b>Полный список</b> — все белые + черные\n"
+            f"Всего: <b>{total}</b> • делю по 300\n\n"
+            f"Выбери протокол (режим):"
         )
         await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=protocol_keyboard(agg_key))
         return
 
-    # --- Выбор протокола ---
     if data.startswith("proto:"):
-        # proto:BLACK_FULL:vless  or proto:WHITE_FULL:all
         try:
             _, agg_key, proto = data.split(":", 2)
         except:
@@ -439,57 +559,49 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             fname = f"{base.replace('.txt','')}_{proto.upper()}.txt"
             display_title = f"{base_title} — {PROTOCOL_LABELS.get(proto, proto.upper())}"
-        # chunks for this filename
         chunks = AGGREGATED_CHUNKS.get(fname, [])
-        # if file empty (proto without configs) handle
         cnt = AGGREGATED_CACHE.get(fname, {}).get("count")
         if cnt is None:
-            # try to compute from proto_counts
             cnt = AGGREGATED_PROTO_COUNTS.get(base, {}).get(proto, 0)
         if cnt == 0:
             await query.message.edit_text(
-                f"{config.PREMIUM['warning']} <b>{display_title}</b>\nПока нет конфигов для <b>{PROTOCOL_LABELS.get(proto, proto)}</b> в этом списке. {config.PREMIUM['cross']}",
+                f"<b>{display_title}</b>\nПока нет конфигов для <b>{PROTOCOL_LABELS.get(proto, proto)}</b> в этом списке.",
                 parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ К протоколам", callback_data=agg_key.lower().replace("_full",""))]])
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«К протоколам»", callback_data=agg_key.lower().replace("_full",""))]])
             )
             return
         raw = get_raw_url(fname)
-        # Determine back target: white/black/full
-        back_target = agg_key.lower().replace("_full","")  # white / black / full
+        back_target = agg_key.lower().replace("_full","")
         if back_target not in ("white","black","full"):
             back_target = "home"
         text = (
-            f"{config.PREMIUM['diamond']} <b>{display_title}</b> {config.PREMIUM['sparkles']}\n"
-            f"Конфигов: <b>{cnt}</b> • делю по 300 {config.PREMIUM['fire_crimson']}\n"
+            f"<b>{display_title}</b>\n"
+            f"Конфигов: <b>{cnt}</b> • делю по 300\n"
             f"Файл: <code>{raw}</code>\n\n"
-            f"{config.PREMIUM['lightning']} Выбери пакет:"
+            f"Выбери пакет:"
         )
         if chunks:
-            kb = chunks_keyboard(fname, chunks, back_data=back_target, back_label="‹ К протоколам")
+            kb = chunks_keyboard(fname, chunks, back_data=back_target, back_label="«К протоколам»")
         else:
-            # single file (<=300)
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("Скачать файл", callback_data=f"rawfile:{fname}"), InlineKeyboardButton("Копировать", callback_data=f"rawcopy:{fname}")],
-                [InlineKeyboardButton("‹ К протоколам", callback_data=back_target)]
+                [InlineKeyboardButton("«Скачать файл»", callback_data=f"rawfile:{fname}"), InlineKeyboardButton("«Копировать»", callback_data=f"rawcopy:{fname}")],
+                [InlineKeyboardButton("«К протоколам»", callback_data=back_target)]
             ])
-            text = f"{config.PREMIUM['diamond']} <b>{display_title}</b> {config.PREMIUM['sparkles']}\n<code>{raw}</code>\nКонфигов: <b>{cnt}</b> {config.PREMIUM['fire_crimson']}"
+            text = f"<b>{display_title}</b>\n<code>{raw}</code>\nКонфигов: <b>{cnt}</b>"
         await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
         return
 
     if data.startswith("chunk:"):
         fname = data.split(":",1)[1]
-        # determine back: if proto file, back to proto chooser; else inferred
         back = "home"
         for proto in PROTOCOLS:
             if f"_{proto.upper()}_" in fname or fname.endswith(f"_{proto.upper()}.txt"):
-                # find base
                 for agg_key, agg in config.AGGREGATED_SUBS.items():
                     base = agg["filename"]
                     if fname.startswith(base.replace(".txt","")):
                         back = agg_key.lower().replace("_full","")
                         break
                 break
-        # check if it's chunk of base without proto -> also map
         if back == "home":
             for agg_key, agg in config.AGGREGATED_SUBS.items():
                 if fname.startswith(agg["filename"].replace(".txt","")):
@@ -503,7 +615,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fname = data.split(":",1)[1]
         raw = get_raw_url(fname)
         await query.message.reply_text(f"<code>{raw}</code>", parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("‹ Назад", callback_data="home")]]))
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
         return
 
     if data.startswith("rawfile:"):
@@ -516,7 +628,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cnt = AGGREGATED_CACHE.get(fname, {}).get("count", "?")
             await query.message.reply_document(document=open(path, "rb"), filename=fname, caption=f"{title} • {cnt}")
         else:
-            await query.message.reply_text(f"{config.PREMIUM['cross']} Файл не найден {config.PREMIUM['warning']}")
+            await query.message.reply_text("Файл не найден")
         return
 
     if data.startswith("raw:"):
@@ -529,12 +641,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cnt = AGGREGATED_CACHE.get(fname, {}).get("count", "—")
         raw = get_raw_url(fname)
         text = f"<b>{title}</b>\n<code>{raw}</code>\nКонфигов: <b>{cnt}</b>"
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Скопировать", callback_data=f"rawcopy:{fname}"), InlineKeyboardButton("Скачать", callback_data=f"rawfile:{fname}")],[InlineKeyboardButton("‹ Назад", callback_data="home")]])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("«Скопировать»", callback_data=f"rawcopy:{fname}"), InlineKeyboardButton("«Скачать»", callback_data=f"rawfile:{fname}")],[InlineKeyboardButton("«Назад»", callback_data="home")]])
         await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
         return
 
     if data.startswith("get:"):
-        await query.answer("Раздел перенесён в «Полный список»", show_alert=False)
+        await query.answer("Раздел перенесен в «Полный список»", show_alert=False)
         await query.message.edit_text(config.WELCOME_TEXT, parse_mode=ParseMode.HTML, reply_markup=main_keyboard(uid))
         return
 
@@ -554,9 +666,9 @@ async def message_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             ok, reason = is_valid_vless(link)
             info = parse_vless_info(link)
             if ok:
-                await update.message.reply_text(f"{config.PREMIUM['lightning']} VLESS: {info.get('remark')}\n{info.get('host')}:{info.get('port')} • валиден {config.PREMIUM['thumbsup']}", reply_markup=main_keyboard(update.effective_user.id))
+                await update.message.reply_text(f"VLESS: {info.get('remark')}\n{info.get('host')}:{info.get('port')} • валиден", reply_markup=main_keyboard(update.effective_user.id))
             else:
-                await update.message.reply_text(f"{config.PREMIUM['cross']} Битый VLESS: {reason} {config.PREMIUM['warning']}")
+                await update.message.reply_text(f"Битый VLESS: {reason}")
 
 def get_raw_url(filename: str) -> str:
     cached = AGGREGATED_CACHE.get(filename, {})
@@ -578,13 +690,13 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_text_handler))
     app.add_handler(CallbackQueryHandler(callback_handler))
-    print(f"🚀 Crimson bot @wtfparsbot интервальный {config.UPDATE_INTERVAL}м")
+    print(f"Crimson bot @wtfparsbot интервальный {config.UPDATE_INTERVAL}м")
     async def _preload():
         try:
             await update_cache()
-            print(f"✅ Кэш {sum(len(v.get('configs',[])) for v in CACHE.values())}")
+            print(f"Кэш {sum(len(v.get('configs',[])) for v in CACHE.values())}")
         except Exception as e:
-            print(f"⚠️ {e}")
+            print(f"Ошибка preload: {e}")
     async def _post_init(app):
         if start_health_server:
             try: await start_health_server()
