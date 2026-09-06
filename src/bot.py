@@ -6,7 +6,7 @@ import base64
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from telegram.constants import ParseMode
 
@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
+ASSETS_DIR = Path(__file__).parent.parent / "assets"
+ASSETS_DIR.mkdir(exist_ok=True)
 
 CACHE = {}
 LAST_UPDATE = None
@@ -130,7 +132,6 @@ def build_aggregated_configs():
                 results[cfname] = {"content": ccontent, "count": cnt, "configs": [], "is_chunk": True}
                 chunk_list.append((cfname, ctitle, cnt))
             chunk_map[filename] = chunk_list
-            logger.info(f"Aggregated {filename}: {len(all_cfgs)} -> {len(chunk_infos)} чанков")
             base_name = filename.replace(".txt", "")
             proto_counts = {}
             for proto in PROTOCOLS:
@@ -183,7 +184,6 @@ async def update_cache(categories=None, mode=None):
     mode = mode or config.CHECK_MODE
     if categories is None:
         categories = list(config.SOURCES.keys())
-    logger.info(f"Updating cache for {categories}")
     result = await fetch_all(mode=mode, categories=categories)
     for key, data in result.items():
         configs = data.get("configs", [])
@@ -219,11 +219,70 @@ def get_raw_url(filename: str) -> str:
     return f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
 
 def get_public_url(filename: str) -> str:
-    """Если задан PUBLIC_URL — отдаем ссылку через наш HTTP сервер /sub/"""
     if config.PUBLIC_URL:
         base = config.PUBLIC_URL.rstrip("/")
         return f"{base}/sub/{filename}"
     return ""
+
+# ---------- Media helpers ----------
+
+def get_banner_path(name: str) -> Path:
+    """name: main, profile, protocols, configs, help"""
+    return ASSETS_DIR / f"banner_{name}.png"
+
+async def send_banner_message(update: Update, context: ContextTypes.DEFAULT_TYPE, banner_name: str, text: str, reply_markup, is_callback=False, query=None):
+    """Отправляет медиа-баннер с текстом. Если is_callback и сообщение уже фото — редактирует медиа."""
+    banner_path = get_banner_path(banner_name)
+    if not banner_path.exists():
+        # fallback без баннера
+        if is_callback and query:
+            try:
+                await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+            except:
+                await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+        else:
+            await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+        return
+
+    try:
+        if is_callback and query:
+            # Если текущее сообщение уже с фото — редактируем медиа
+            if query.message.photo:
+                with open(banner_path, 'rb') as f:
+                    media = InputMediaPhoto(media=f, caption=text, parse_mode=ParseMode.HTML)
+                    await query.message.edit_media(media=media, reply_markup=reply_markup)
+            else:
+                # Текстовое сообщение — отправляем новое фото и удаляем старое для чистоты
+                await query.message.reply_photo(
+                    photo=open(banner_path, 'rb'),
+                    caption=text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=reply_markup
+                )
+                try:
+                    await query.message.delete()
+                except:
+                    pass
+        else:
+            # Команда /start
+            if banner_path.exists():
+                await update.message.reply_photo(
+                    photo=open(banner_path, 'rb'),
+                    caption=text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=reply_markup
+                )
+            else:
+                await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"banner {banner_name} send failed: {e}")
+        if is_callback and query:
+            try:
+                await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+            except:
+                await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+        else:
+            await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
 
 # ---------- Handlers ----------
 
@@ -233,20 +292,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Клавиатура обновлена — жми «Главное меню» внизу",
         reply_markup=REPLY_MENU
     )
-    await update.message.reply_text(
-        config.WELCOME_TEXT,
-        parse_mode=ParseMode.HTML,
-        reply_markup=main_keyboard(uid)
-    )
+    await send_banner_message(update, context, "main", config.WELCOME_TEXT, main_keyboard(uid), is_callback=False)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else None
-    await update.message.reply_text(config.HELP_TEXT, parse_mode=ParseMode.HTML, reply_markup=main_keyboard(uid))
+    await send_banner_message(update, context, "help", config.HELP_TEXT, main_keyboard(uid), is_callback=False)
 
 async def handle_main_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "Главное меню":
         uid = update.effective_user.id if update.effective_user else None
-        await update.message.reply_text(config.WELCOME_TEXT, parse_mode=ParseMode.HTML, reply_markup=main_keyboard(uid))
+        await send_banner_message(update, context, "main", config.WELCOME_TEXT, main_keyboard(uid), is_callback=False)
         return True
     return False
 
@@ -270,23 +325,21 @@ async def send_chunk_file(query, fname, back_data="home"):
                 title = f"{base_title} — {fname}"
                 break
         cnt = AGGREGATED_CACHE.get(fname, {}).get("count", "?")
-        raw = get_raw_url(fname)
-        public = get_public_url(fname)
-        link = public or raw
-        await query.message.reply_text(
-            f"<b>{title}</b>\n<code>{link}</code>\nКонфигов: <b>{cnt}</b>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("«Скачать файл»", callback_data=f"rawfile:{fname}"), InlineKeyboardButton("«Копировать ссылку»", callback_data=f"rawcopy:{fname}")],
-                [InlineKeyboardButton("«Назад»", callback_data=back_data)]
-            ])
-        )
+        raw = get_public_url(fname) or get_raw_url(fname)
+        text = f"<b>{title}</b>\n<code>{raw}</code>\nКонфигов: <b>{cnt}</b>"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("«Скачать файл»", callback_data=f"rawfile:{fname}"), InlineKeyboardButton("«Копировать ссылку»", callback_data=f"rawcopy:{fname}")],
+            [InlineKeyboardButton("«Назад»", callback_data=back_data)]
+        ])
+        # Для конфигов показываем баннер конфигов
+        await send_banner_message(None, None, "configs", text, kb, is_callback=True, query=query)
         try:
             await query.message.reply_document(document=open(path, "rb"), filename=fname, caption=f"{title} • {cnt}")
         except Exception as e:
             logger.error(e)
 
 async def handle_build_subscription(query, user_id):
+    # Показываем временный баннер конфигов
     await query.message.edit_text("Собираю подписку из 100 рабочих конфигов, подожди 5-10 сек...")
     if not CACHE:
         await update_cache()
@@ -303,25 +356,16 @@ async def handle_build_subscription(query, user_id):
         if ok:
             valid_configs.append(c)
     if not valid_configs:
-        await query.message.edit_text(
-            "Не удалось найти рабочие конфиги. Попробуй обновить кэш.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]])
-        )
+        await send_banner_message(None, None, "configs", "Не удалось найти рабочие конфиги. Попробуй обновить кэш.", InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]), is_callback=True, query=query)
         return
     random.shuffle(valid_configs)
     selected = valid_configs[:100] if len(valid_configs) >= 100 else valid_configs
-
     title = "Free VPN • Crimson — Custom 100"
-    # ОДНА подписка на пользователя — удобно и без конфликтов
     filename = f"CUSTOM_100_{user_id}.txt"
-
     try:
         path, b64_path, content, b64_content = save_aggregated_file(str(DATA_DIR), filename, title, selected)
-
-        # Пытаемся запушить в GitHub (чтобы ссылка не давала 404)
         raw_url = None
         public_url = get_public_url(filename)
-
         if config.GITHUB_TOKEN and config.GITHUB_REPO:
             try:
                 from github_sync import push_aggregated_subscriptions
@@ -330,30 +374,22 @@ async def handle_build_subscription(query, user_id):
                 raw_map = await push_aggregated_subscriptions({p: content}, config.GITHUB_REPO, config.GITHUB_TOKEN, config.GITHUB_BRANCH)
                 raw_url = raw_map.get(p)
                 if raw_url:
-                    # Проверяем доступность (иногда GitHub отдает 404 первые секунды)
                     await asyncio.sleep(1)
             except Exception as e:
                 logger.error(f"push custom failed: {e}")
-
-        # Выбираем ОДНУ основную ссылку — приоритет: PUBLIC_URL > GitHub > нет ссылки
         primary_link = public_url or raw_url
         if primary_link:
             link_text = f"<code>{primary_link}</code>"
         else:
             link_text = "Ссылка будет доступна после включения PUBLIC_URL или GITHUB. Пока используй файл ниже."
-
         AGGREGATED_CACHE[filename] = {"count": len(selected), "content": content, "raw_url": raw_url or primary_link or get_raw_url(filename)}
-
         text = (
             f"<b>Готово — собрано {len(selected)} рабочих конфигов</b>\n\n"
             f"{'Ссылка на подписку:' if primary_link else ''}\n{link_text}\n\n"
             f"Количество: <b>{len(selected)}</b>\n"
             f"Файл: <code>{filename}</code>\n\n"
-            f"Добавь ссылку в Happ / Streisand / v2rayNG как URL подписки. "
-            f"Если ссылка не открывается — просто скачай файл и импортируй его."
+            f"Добавь ссылку в Happ / Streisand / v2rayNG как URL подписки."
         )
-
-        # Удобные кнопки — все что нужно в одном месте
         kb_rows = []
         if primary_link:
             kb_rows.append([InlineKeyboardButton("«Скопировать ссылку»", callback_data=f"rawcopy:{filename}")])
@@ -366,22 +402,17 @@ async def handle_build_subscription(query, user_id):
             InlineKeyboardButton("«Собрать еще раз»", callback_data="build_subscription")
         ])
         kb_rows.append([InlineKeyboardButton("«Назад»", callback_data="home")])
-
-        await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb_rows))
-
+        await send_banner_message(None, None, "configs", text, InlineKeyboardMarkup(kb_rows), is_callback=True, query=query)
         try:
-            await query.message.reply_document(document=open(path, "rb"), filename=filename, caption=f"Custom 100 • {len(selected)} конфигов • {filename}")
+            await query.message.reply_document(document=open(path, "rb"), filename=filename, caption=f"Custom 100 • {len(selected)} конфигов")
         except Exception as e:
             logger.error(e)
-
-        # Также отправляем base64 файл для клиентов которым нужен base64
         try:
             b64_path_obj = DATA_DIR / f"{filename.replace('.txt','_base64.txt')}"
             if b64_path_obj.exists():
                 await query.message.reply_document(document=open(b64_path_obj, "rb"), filename=b64_path_obj.name, caption=f"Base64 • {len(selected)}")
         except Exception as e:
             logger.error(e)
-
     except Exception as e:
         logger.error(f"build custom error: {e}")
         await query.message.edit_text(f"Ошибка при сборке подписки: {e}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
@@ -419,7 +450,6 @@ async def handle_admin_clean(query):
             asyncio.create_task(push_aggregated_to_github(agg))
     except Exception as e:
         logger.error(f"rebuild after clean failed: {e}")
-
     text = (
         f"<b>Очистка завершена</b>\n\n"
         f"Было: {total_before}\n"
@@ -442,7 +472,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = query.from_user.id if query.from_user else 0
 
     if data == "home":
-        await query.message.edit_text(config.WELCOME_TEXT, parse_mode=ParseMode.HTML, reply_markup=main_keyboard(uid))
+        await send_banner_message(update, context, "main", config.WELCOME_TEXT, main_keyboard(uid), is_callback=True, query=query)
         return
 
     if data == "profile":
@@ -453,13 +483,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Username: @{user.username or '—'}\n"
             f"Имя: {user.first_name or '—'}"
         )
-        await query.message.reply_text(text, parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
+        await send_banner_message(update, context, "profile", text, InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]), is_callback=True, query=query)
         return
 
     if data == "help":
-        await query.message.reply_text(config.HELP_TEXT, parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
+        await send_banner_message(update, context, "help", config.HELP_TEXT, InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]), is_callback=True, query=query)
         return
 
     if data == "build_subscription":
@@ -529,7 +557,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Всего: <b>{total}</b> • делю по 300\n\n"
             f"Выбери протокол (режим):"
         )
-        await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=protocol_keyboard(agg_key))
+        # Белые — это часть конфигов, но показываем протоколы баннер
+        await send_banner_message(update, context, "configs", text, protocol_keyboard(agg_key), is_callback=True, query=query)
         return
 
     if data == "black":
@@ -544,7 +573,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Всего: <b>{total}</b> • делю по 300\n\n"
             f"Выбери протокол (режим):"
         )
-        await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=protocol_keyboard(agg_key))
+        await send_banner_message(update, context, "configs", text, protocol_keyboard(agg_key), is_callback=True, query=query)
         return
 
     if data == "full":
@@ -559,7 +588,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Всего: <b>{total}</b> • делю по 300\n\n"
             f"Выбери протокол (режим):"
         )
-        await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=protocol_keyboard(agg_key))
+        await send_banner_message(update, context, "configs", text, protocol_keyboard(agg_key), is_callback=True, query=query)
         return
 
     if data.startswith("proto:"):
@@ -585,11 +614,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if cnt is None:
             cnt = AGGREGATED_PROTO_COUNTS.get(base, {}).get(proto, 0)
         if cnt == 0:
-            await query.message.edit_text(
-                f"<b>{display_title}</b>\nПока нет конфигов для <b>{PROTOCOL_LABELS.get(proto, proto)}</b> в этом списке.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«К протоколам»", callback_data=agg_key.lower().replace("_full",""))]])
-            )
+            await send_banner_message(update, context, "protocols", f"<b>{display_title}</b>\nПока нет конфигов для <b>{PROTOCOL_LABELS.get(proto, proto)}</b> в этом списке.", InlineKeyboardMarkup([[InlineKeyboardButton("«К протоколам»", callback_data=agg_key.lower().replace("_full",""))]]), is_callback=True, query=query)
             return
         raw = get_public_url(fname) or get_raw_url(fname)
         back_target = agg_key.lower().replace("_full","")
@@ -609,7 +634,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("«К протоколам»", callback_data=back_target)]
             ])
             text = f"<b>{display_title}</b>\n<code>{raw}</code>\nКонфигов: <b>{cnt}</b>"
-        await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        await send_banner_message(update, context, "protocols", text, kb, is_callback=True, query=query)
         return
 
     if data.startswith("chunk:"):
@@ -647,14 +672,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         content = path.read_text(encoding="utf-8")
         b64 = base64.b64encode(content.encode('utf-8')).decode('utf-8')
-        # Отправляем как файл + текст (телеграм не дает скопировать слишком длинный текст, поэтому файл)
         if len(b64) < 4000:
             await query.message.reply_text(f"<code>{b64}</code>", parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]]))
         else:
             b64_path = DATA_DIR / f"{fname.replace('.txt','_base64.txt')}"
             await query.message.reply_text(
-                f"Base64 подписка слишком длинная для сообщения, вот файл. Скопируй содержимое файла и вставь в клиент.",
+                f"Base64 подписка слишком длинная для сообщения, вот файл.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("«Назад»", callback_data="home")]])
             )
             if b64_path.exists():
@@ -696,12 +720,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raw = get_public_url(fname) or get_raw_url(fname)
         text = f"<b>{title}</b>\n<code>{raw}</code>\nКонфигов: <b>{cnt}</b>"
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("«Скопировать»", callback_data=f"rawcopy:{fname}"), InlineKeyboardButton("«Скачать»", callback_data=f"rawfile:{fname}")],[InlineKeyboardButton("«Назад»", callback_data="home")]])
-        await query.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        await send_banner_message(update, context, "configs", text, kb, is_callback=True, query=query)
         return
 
     if data.startswith("get:"):
         await query.answer("Раздел перенесен в «Полный список»", show_alert=False)
-        await query.message.edit_text(config.WELCOME_TEXT, parse_mode=ParseMode.HTML, reply_markup=main_keyboard(uid))
+        await send_banner_message(update, context, "main", config.WELCOME_TEXT, main_keyboard(uid), is_callback=True, query=query)
         return
 
 # ---------- Message handlers ----------
@@ -710,7 +734,7 @@ async def message_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     text = (update.message.text or "").strip()
     if text == "Главное меню":
         uid = update.effective_user.id if update.effective_user else None
-        await update.message.reply_text(config.WELCOME_TEXT, parse_mode=ParseMode.HTML, reply_markup=main_keyboard(uid))
+        await send_banner_message(update, context, "main", config.WELCOME_TEXT, main_keyboard(uid), is_callback=False)
         return
     if "vless://" in text:
         import re
