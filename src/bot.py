@@ -399,9 +399,7 @@ def activate_aggregated_configs(results, chunk_map, proto_counts_map, raw_map=No
             else filename
         ).lstrip("/")
         raw_url = raw_map.get(relative_path, "")
-        if config.PUBLIC_URL:
-            raw_url = f"{config.PUBLIC_URL}/sub/{filename}"
-        elif not raw_url and not config.GITHUB_SUB_PATH:
+        if not raw_url and not config.GITHUB_SUB_PATH:
             # A committed bootstrap file is safe only when it has exactly the
             # same bytes as the generation now being activated.
             repository_path = Path(__file__).parent.parent / filename
@@ -541,9 +539,7 @@ async def _update_cache(categories=None, mode=None, bot=None):
     return result
 
 def get_raw_url(filename: str) -> str:
-    """Return a verified runtime/published URL, or an empty string."""
-    if config.PUBLIC_URL:
-        return f"{config.PUBLIC_URL}/sub/{filename}"
+    """Return only a verified GitHub raw URL for a published .txt file."""
     return AGGREGATED_CACHE.get(filename, {}).get("raw_url", "")
 
 

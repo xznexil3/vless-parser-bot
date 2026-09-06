@@ -45,7 +45,7 @@ def generate_aggregated_content(profile_title: str, configs: list) -> str:
     return make_subscription_content(configs, header)
 
 def save_subscription_files(base_dir: str, category_key: str, configs: list, profile_title: str, use_igareck_header: bool = False):
-    # Работаем только с .txt, без base64 и без yourdomain
+    # Работаем только с опубликованными .txt-файлами.
     os.makedirs(base_dir, exist_ok=True)
     header = generate_igareck_style_header(profile_title, len(configs)) if use_igareck_header else generate_header(profile_title, len(configs))
     plain_content = make_subscription_content(configs, header)

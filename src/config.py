@@ -38,9 +38,6 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", os.getenv("GH_TOKEN", ""))
 GITHUB_REPO = os.getenv("GITHUB_REPO", "xznexil3/vless-parser-bot")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
 GITHUB_SUB_PATH = os.getenv("GITHUB_SUB_PATH", "")
-PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
-if not PUBLIC_URL and os.getenv("RAILWAY_PUBLIC_DOMAIN"):
-    PUBLIC_URL = f"https://{os.environ['RAILWAY_PUBLIC_DOMAIN'].strip().rstrip('/')}"
 
 
 def is_admin(uid: int) -> bool:

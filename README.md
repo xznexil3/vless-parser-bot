@@ -75,7 +75,7 @@ TCP-проверка подтверждает доступность endpoint-а
 - синхронизированная смена карты кнопок и файлов без ссылок на отсутствующие пакеты;
 - обработка старых кнопок вроде `BLACK_FULL_6.txt` с переходом к актуальным пакетам;
 - ручная строгая проверка одного вставленного VLESS URI;
-- Railway HTTP endpoint `/sub/<file>.txt` и `/sub/<file>.txt/b64` для runtime-подписок.
+- только прямые GitHub Raw-ссылки на опубликованные `.txt`-файлы, без промежуточных доменов.
 
 ## 🚀 Запуск
 
@@ -122,10 +122,8 @@ docker logs -f vless-parser-bot
 | `DISCOVERY_MIN_VALID` | Минимум валидных VLESS для принятия feed-а | `5` |
 | `GITHUB_TOKEN` | Токен для публикации агрегатов | — |
 | `GITHUB_REPO` | Репозиторий агрегатов | `xznexil3/vless-parser-bot` |
-| `GITHUB_BRANCH` | Ветка публикации | `main` |
-| `PUBLIC_URL` | Публичный адрес runtime-подписок без завершающего `/` | определяется через Railway |
-| `RAILWAY_PUBLIC_DOMAIN` | Railway domain; автоматически превращается в `PUBLIC_URL` | Railway variable |
-| `PORT` | Порт health/subscription HTTP-сервера | `8080` |
+| `GITHUB_BRANCH` | Ветка публикации `.txt`-файлов | `main` |
+| `PORT` | Порт Railway health-сервера | `8080` |
 
 ## 🧠 Pipeline
 
@@ -148,7 +146,7 @@ python -m unittest discover -s tests -v
 python -m py_compile src/*.py tests/*.py
 ```
 
-Тесты покрывают plain/base64/escaped extraction, VLESS/Reality validation, private host rejection, normalized deduplication, mirror fallback, ограниченный GitHub discovery, endpoint check deduplication, 11 обязательных белых провайдеров, AetrisVPN, цветовые стили кнопок, runtime HTTP-подписки и очистку устаревших chunks.
+Тесты покрывают plain/base64/escaped extraction, VLESS/Reality validation, private host rejection, normalized deduplication, mirror fallback, ограниченный GitHub discovery, endpoint check deduplication, 11 обязательных белых провайдеров, AetrisVPN, цветовые стили кнопок, GitHub Raw `.txt`-ссылки и очистку устаревших chunks.
 
 ## 📂 Структура
 
@@ -159,8 +157,7 @@ vless-parser-bot/
 │   ├── config.py       # источники, зеркала и агрегаты
 │   ├── parser.py       # fetch/extract/validate/dedup/TCP
 │   ├── subscription.py # atomic plain/base64/chunk generation
-│   ├── health.py       # Railway health + runtime subscriptions
-│   └── server.py       # standalone HTTP endpoint
+│   └── health.py       # Railway health-check only
 ├── tests/
 │   └── test_parser.py
 ├── data/               # runtime-файлы

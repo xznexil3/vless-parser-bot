@@ -7,7 +7,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -287,34 +286,17 @@ class AsyncValidationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class HealthEndpointTests(unittest.IsolatedAsyncioTestCase):
-    async def test_runtime_subscription_and_base64_are_served(self):
-        with tempfile.TemporaryDirectory() as directory:
-            data_dir = Path(directory) / "data"
-            data_dir.mkdir()
-            (data_dir / "BLACK_FULL_6.txt").write_text("vless://test", encoding="utf-8")
-            with patch.object(health, "DATA_DIR", data_dir):
-                client = TestClient(TestServer(health.create_health_app()))
-                await client.start_server()
-                try:
-                    plain = await client.get("/sub/BLACK_FULL_6.txt")
-                    encoded = await client.get("/sub/BLACK_FULL_6.txt/b64")
-                    self.assertEqual(plain.status, 200)
-                    self.assertEqual(await plain.read(), b"vless://test")
-                    self.assertEqual(encoded.status, 200)
-                    self.assertEqual(base64.b64decode(await encoded.read()), b"vless://test")
-                finally:
-                    await client.close()
-
-    async def test_missing_runtime_subscription_returns_404(self):
-        with tempfile.TemporaryDirectory() as directory:
-            with patch.object(health, "DATA_DIR", Path(directory)):
-                with patch.object(health, "ROOT_DIR", Path(directory)):
-                    with self.assertRaises(web.HTTPNotFound):
-                        await health.subscription(
-                            SimpleNamespace(
-                                match_info={"filename": "BLACK_FULL_6.txt", "encoding": ""}
-                            )
-                        )
+    async def test_health_works_but_domain_subscription_routes_do_not_exist(self):
+        client = TestClient(TestServer(health.create_health_app()))
+        await client.start_server()
+        try:
+            health_response = await client.get("/health")
+            subscription_response = await client.get("/sub/BLACK_FULL_6.txt")
+            self.assertEqual(health_response.status, 200)
+            self.assertEqual(await health_response.text(), "OK - VLESS parser bot is running")
+            self.assertEqual(subscription_response.status, 404)
+        finally:
+            await client.close()
 
 
 class CommittedAggregateTests(unittest.TestCase):
@@ -472,17 +454,21 @@ class SubscriptionTests(unittest.TestCase):
                 patch.object(bot, "AGGREGATED_CACHE", {}),
                 patch.object(bot, "AGGREGATED_CHUNKS", {}),
                 patch.object(bot, "AGGREGATED_PROTO_COUNTS", {}),
-                patch.object(config, "PUBLIC_URL", "https://bot.example"),
             ):
+                raw_url = (
+                    "https://raw.githubusercontent.com/owner/repo/"
+                    "main/BLACK_FULL_1.txt"
+                )
                 bot.activate_aggregated_configs(
                     results,
                     chunk_map,
                     {"BLACK_FULL.txt": {"vless": 1}},
+                    {"BLACK_FULL_1.txt": raw_url},
                 )
                 self.assertEqual(bot.AGGREGATED_CHUNKS, chunk_map)
                 self.assertEqual(
                     bot.AGGREGATED_CACHE["BLACK_FULL_1.txt"]["raw_url"],
-                    "https://bot.example/sub/BLACK_FULL_1.txt",
+                    raw_url,
                 )
                 self.assertFalse(stale.exists())
 
@@ -551,17 +537,23 @@ class SourceRegistryTests(unittest.TestCase):
         self.assertEqual(back.text, "«Назад»")
         self.assertEqual(back.style, KeyboardButtonStyle.PRIMARY)
 
-    def test_runtime_subscription_url_is_preferred_on_railway(self):
-        with patch.object(config, "PUBLIC_URL", "https://bot.example"):
-            self.assertEqual(
-                bot.get_raw_url("BLACK_FULL_6.txt"),
-                "https://bot.example/sub/BLACK_FULL_6.txt",
-            )
+    def test_only_published_github_txt_url_is_returned(self):
+        raw_url = (
+            "https://raw.githubusercontent.com/xznexil3/vless-parser-bot/"
+            "main/BLACK_FULL_6.txt"
+        )
+        with patch.object(
+            bot,
+            "AGGREGATED_CACHE",
+            {"BLACK_FULL_6.txt": {"raw_url": raw_url}},
+        ):
+            self.assertEqual(bot.get_raw_url("BLACK_FULL_6.txt"), raw_url)
 
     def test_unpublished_chunk_does_not_get_an_invented_github_url(self):
-        with (
-            patch.object(config, "PUBLIC_URL", ""),
-            patch.object(bot, "AGGREGATED_CACHE", {"BLACK_FULL_6.txt": {"raw_url": ""}}),
+        with patch.object(
+            bot,
+            "AGGREGATED_CACHE",
+            {"BLACK_FULL_6.txt": {"raw_url": ""}},
         ):
             self.assertEqual(bot.get_raw_url("BLACK_FULL_6.txt"), "")
 
@@ -577,8 +569,8 @@ class SourceRegistryTests(unittest.TestCase):
         checked_files = [
             ROOT / "src" / "bot.py",
             ROOT / "src" / "config.py",
-            ROOT / "src" / "server.py",
         ]
+        self.assertFalse((ROOT / "src" / "server.py").exists())
         content = "\n".join(path.read_text(encoding="utf-8") for path in checked_files)
         for obsolete in (
             "CUSTOM_100",
