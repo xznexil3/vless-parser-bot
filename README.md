@@ -30,6 +30,8 @@ Telegram-бот собирает публичные VLESS-конфигураци
 
 Чёрные feed-ы igareck, EtoNeYa, Ghost VPN и автообновляемая подписка [AetrisVPN](https://raw.githubusercontent.com/flaafix/AetrisVPN-black-list/main/configs.txt) зарегистрированы отдельно и не смешиваются с белым агрегатом. Бот сам загружает их из интернета при старте и каждом периодическом обновлении, оставляет только валидные VLESS и объединяет результат в `BLACK_FULL.txt` и `FULL.txt`.
 
+Дополнительно включён ограниченный автопоиск: бот читает поддерживаемый индекс VLESS-подписок, ищет недавно обновлённые публичные репозитории через GitHub API, выбирает только похожие на подписки текстовые файлы и загружает их параллельно. Неизвестные сайты не обходятся произвольно: это защищает Railway от SSRF, огромных ответов и бесконечного crawler-а. Один feed принимается только при наличии минимум пяти валидных VLESS; количество репозиториев, файлов и конфигураций жёстко ограничено.
+
 ## ✅ Извлечение и проверка
 
 Парсер работает только с VLESS и извлекает URI из:
@@ -114,6 +116,10 @@ docker logs -f vless-parser-bot
 | `REQUIRED_CHANNEL` | Канал для проверки подписки пользователя | `@vpncrimson` |
 | `CHECK_MODE` | `none`, `syntax` или `tcp` | `syntax` |
 | `UPDATE_INTERVAL` | Интервал автообновления, минут | `60` |
+| `AUTO_DISCOVERY` | Автопоиск новых публичных GitHub VLESS feed-ов | `true` |
+| `DISCOVERY_MAX_REPOS` | Максимум репозиториев за один поиск | `6` |
+| `DISCOVERY_MAX_FEEDS` | Максимум найденных файлов за обновление | `20` |
+| `DISCOVERY_MIN_VALID` | Минимум валидных VLESS для принятия feed-а | `5` |
 | `GITHUB_TOKEN` | Токен для публикации агрегатов | — |
 | `GITHUB_REPO` | Репозиторий агрегатов | `xznexil3/vless-parser-bot` |
 | `GITHUB_BRANCH` | Ветка публикации | `main` |
@@ -124,7 +130,7 @@ docker logs -f vless-parser-bot
 ## 🧠 Pipeline
 
 ```text
-provider/mirror
+known providers + bounded GitHub discovery
   → bounded fetch
   → plain / escaped / base64 extraction
   → strict VLESS validation
@@ -142,7 +148,7 @@ python -m unittest discover -s tests -v
 python -m py_compile src/*.py tests/*.py
 ```
 
-Тесты покрывают plain/base64/escaped extraction, VLESS/Reality validation, private host rejection, normalized deduplication, mirror fallback, endpoint check deduplication, 11 обязательных провайдеров, цветовые стили кнопок, runtime HTTP-подписки и очистку устаревших chunks.
+Тесты покрывают plain/base64/escaped extraction, VLESS/Reality validation, private host rejection, normalized deduplication, mirror fallback, ограниченный GitHub discovery, endpoint check deduplication, 11 обязательных белых провайдеров, AetrisVPN, цветовые стили кнопок, runtime HTTP-подписки и очистку устаревших chunks.
 
 ## 📂 Структура
 

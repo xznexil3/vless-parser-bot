@@ -24,6 +24,15 @@ CHANNEL_LINK = "https://t.me/vpncrimson"
 CHECK_MODE = os.getenv("CHECK_MODE", "syntax").strip().lower()
 UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", "60"))
 PORT = int(os.getenv("PORT", "8080"))
+AUTO_DISCOVERY = os.getenv("AUTO_DISCOVERY", "true").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+DISCOVERY_MAX_REPOS = max(1, min(int(os.getenv("DISCOVERY_MAX_REPOS", "6")), 12))
+DISCOVERY_MAX_FEEDS = max(1, min(int(os.getenv("DISCOVERY_MAX_FEEDS", "20")), 40))
+DISCOVERY_MIN_VALID = max(1, min(int(os.getenv("DISCOVERY_MIN_VALID", "5")), 100))
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", os.getenv("GH_TOKEN", ""))
 GITHUB_REPO = os.getenv("GITHUB_REPO", "xznexil3/vless-parser-bot")
@@ -196,7 +205,22 @@ SOURCES = {
             "https://raw.githubusercontent.com/flaafix/AetrisVPN-black-list/main/configs.txt",
         ],
     },
+    "internet_discovery": {
+        "name": "Автопоиск VLESS в интернете",
+        "description": "Ограниченный поиск свежих публичных GitHub-подписок",
+        "discovery": True,
+        "index_urls": [
+            "https://raw.githubusercontent.com/NiREvil/vless/main/README.md",
+        ],
+        "search_queries": [
+            "vless subscription in:name,description,readme stars:>20",
+            "free vless configs in:name,description,readme stars:>10",
+        ],
+        "urls": [],
+    },
 }
+if not AUTO_DISCOVERY:
+    SOURCES.pop("internet_discovery", None)
 
 BLACK_SOURCE_KEYS = [
     "igareck_black",
@@ -204,6 +228,8 @@ BLACK_SOURCE_KEYS = [
     "ghost_vpn_black",
     "aetris_vpn",
 ]
+if AUTO_DISCOVERY:
+    BLACK_SOURCE_KEYS.append("internet_discovery")
 WHITE_SOURCE_KEYS = list(REQUIRED_PROVIDER_KEYS)
 FULL_SOURCE_KEYS = WHITE_SOURCE_KEYS + BLACK_SOURCE_KEYS
 
@@ -256,6 +282,6 @@ HELP_TEXT = """<b>Free VPN • Crimson — помощь</b>
 
 SOURCES_TEXT = """<b>Источники VLESS</b>
 
-Сборник подписок против БС, zieng2, EtoNeYa, igareck, CID VPN, wrtrmmu, wlrus.lol, ByeWhiteLists 2.0, Vercel, Ghost-vpn.ru и VPN bolt.
+Сборник подписок против БС, zieng2, EtoNeYa, igareck, CID VPN, wrtrmmu, wlrus.lol, ByeWhiteLists 2.0, Vercel, Ghost-vpn.ru, VPN bolt, AetrisVPN и автоматический поиск свежих GitHub-подписок.
 
-Из payload извлекаются только корректные <b>VLESS</b>; зеркала используются как fallback, дубликаты удаляются."""
+При каждом обновлении бот заново загружает интернет-источники. Из payload извлекаются только корректные <b>VLESS</b>; зеркала используются как fallback, дубликаты удаляются."""

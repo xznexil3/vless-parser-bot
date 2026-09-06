@@ -152,8 +152,49 @@ class ExtractionTests(unittest.TestCase):
         second = vless(query="encryption=none&security=tls&type=ws", fragment="two")
         self.assertEqual(parser.deduplicate_configs([first, second, first]), [first])
 
+    def test_discovery_extracts_only_likely_github_feed_urls(self):
+        vless_feed = "https://raw.githubusercontent.com/owner/repo/main/vless.txt"
+        config_page = "https://github.com/owner/repo/raw/main/configs.txt"
+        config_feed = "https://raw.githubusercontent.com/owner/repo/main/configs.txt"
+        payload = "\n".join(
+            [
+                vless_feed,
+                config_page,
+                "https://raw.githubusercontent.com/owner/repo/main/README.md",
+                "https://example.com/vless.txt",
+                "https://raw.githubusercontent.com/owner/repo/main/logo.png",
+            ]
+        )
+        self.assertEqual(
+            parser.extract_discovery_urls(payload),
+            [vless_feed, config_feed],
+        )
+
 
 class AsyncValidationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fetch_text_reads_every_stream_chunk(self):
+        class Content:
+            async def iter_chunked(self, _size):
+                yield b"vless://first"
+                yield b"-second"
+
+        class Response:
+            status = 200
+            charset = "utf-8"
+            content = Content()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        session = SimpleNamespace(get=lambda *args, **kwargs: Response())
+        self.assertEqual(
+            await parser.fetch_text(session, "https://example.invalid/feed"),
+            "vless://first-second",
+        )
+
     async def test_tcp_checks_each_unique_endpoint_once(self):
         one = vless(fragment="one")
         duplicate_endpoint = vless(
@@ -214,6 +255,36 @@ class AsyncValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["used_urls"], ["https://good.invalid"])
         self.assertEqual(fetch.await_count, 2)
 
+    async def test_discovery_downloads_valid_vless_from_found_feeds(self):
+        first_url = "https://raw.githubusercontent.com/new/feed/main/vless.txt"
+        second_url = "https://raw.githubusercontent.com/new/feed/main/empty.txt"
+        links = [
+            vless(host=f"node{index}.example.com", port=4000 + index, fragment=str(index))
+            for index in range(1, 7)
+        ]
+
+        async def fake_fetch(_session, url):
+            if url == first_url:
+                return "\n".join([*links, "vmess://ignored"])
+            return "not a subscription"
+
+        source = {"name": "discovery", "description": "test", "index_urls": []}
+        with patch.object(
+            parser,
+            "discover_github_feed_urls",
+            AsyncMock(return_value=([first_url, second_url], [])),
+        ):
+            with patch.object(parser, "fetch_text", AsyncMock(side_effect=fake_fetch)):
+                result = await parser.fetch_discovered_category(
+                    None,
+                    "internet_discovery",
+                    source,
+                    "syntax",
+                )
+        self.assertEqual(result["configs"], links)
+        self.assertEqual(result["used_urls"], [first_url])
+        self.assertEqual(result["raw_total"], len(links))
+
 
 class HealthEndpointTests(unittest.IsolatedAsyncioTestCase):
     async def test_runtime_subscription_and_base64_are_served(self):
@@ -273,8 +344,6 @@ class CommittedAggregateTests(unittest.TestCase):
                 self.assertLessEqual(len(part), subscription.CHUNK_SIZE)
                 reconstructed.extend(part)
             self.assertEqual(reconstructed, self._links(ROOT / base))
-
-        self.assertFalse((ROOT / "BLACK_FULL_6.txt").exists())
 
 
 class GithubSyncTests(unittest.IsolatedAsyncioTestCase):
@@ -450,6 +519,15 @@ class SourceRegistryTests(unittest.TestCase):
         self.assertIn("aetris_vpn", config.AGGREGATED_SUBS["BLACK_FULL"]["source_keys"])
         self.assertIn("aetris_vpn", config.AGGREGATED_SUBS["FULL"]["source_keys"])
         self.assertNotIn("aetris_vpn", config.AGGREGATED_SUBS["WHITE_FULL"]["source_keys"])
+
+    def test_bounded_internet_discovery_is_enabled_in_black_and_full(self):
+        self.assertTrue(config.AUTO_DISCOVERY)
+        self.assertTrue(config.SOURCES["internet_discovery"]["discovery"])
+        self.assertIn("internet_discovery", config.BLACK_SOURCE_KEYS)
+        self.assertIn(
+            "internet_discovery",
+            config.AGGREGATED_SUBS["FULL"]["source_keys"],
+        )
 
     def test_admin_label_is_exact(self):
         bot_source = (ROOT / "src" / "bot.py").read_text(encoding="utf-8")
