@@ -575,7 +575,11 @@ class SubscriptionTests(unittest.TestCase):
                     "content": "main",
                     "configs": [config_link],
                 },
-                "BLACK_FULL_1.txt": {"count": 1, "content": "chunk"},
+                "BLACK_FULL_1.txt": {
+                    "count": 1,
+                    "content": "chunk",
+                    "configs": [config_link],
+                },
             }
             chunk_map = {"BLACK_FULL.txt": [("BLACK_FULL_1.txt", "one", 1)]}
             with (
@@ -598,6 +602,10 @@ class SubscriptionTests(unittest.TestCase):
                     bot.AGGREGATED_CACHE["BLACK_FULL.txt"]["configs"],
                     [config_link],
                 )
+                self.assertEqual(
+                    bot.AGGREGATED_CACHE["BLACK_FULL_1.txt"]["configs"],
+                    [config_link],
+                )
                 self.assertNotIn(
                     "raw_url",
                     bot.AGGREGATED_CACHE["BLACK_FULL_1.txt"],
@@ -614,6 +622,77 @@ class SubscriptionTests(unittest.TestCase):
 
 
 class ConfigConnectivityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_generated_chunks_retain_only_their_own_config_lists(self):
+        links = [
+            vless(host=f"node{index}.example.com", fragment=f"Node-{index}")
+            for index in range(301)
+        ]
+        aggregate_defs = {
+            "FULL": {
+                "filename": "FULL.txt",
+                "title": "test",
+                "profile_title": "Test full",
+                "source_keys": ["source"],
+            }
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(bot, "DATA_DIR", Path(directory)),
+                patch.object(bot, "CACHE", {"source": {"configs": links}}),
+                patch.object(config, "AGGREGATED_SUBS", aggregate_defs),
+            ):
+                results, chunk_map, _ = bot.build_aggregated_configs()
+        self.assertEqual(
+            [count for _, _, count in chunk_map["FULL.txt"]],
+            [300, 1],
+        )
+        self.assertEqual(results["FULL_1.txt"]["configs"], links[:300])
+        self.assertEqual(results["FULL_2.txt"]["configs"], links[300:])
+        self.assertNotIn(links[300], results["FULL_1.txt"]["configs"])
+
+    async def test_protocol_entry_opens_packages_before_any_config_list(self):
+        query = SimpleNamespace(
+            data="proto:FULL:all",
+            from_user=SimpleNamespace(id=123, username="", first_name="User"),
+            answer=AsyncMock(),
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+        update = SimpleNamespace(callback_query=query)
+        context = SimpleNamespace(bot=SimpleNamespace(), user_data={})
+        with (
+            patch.object(bot, "is_user_subscribed", AsyncMock(return_value=True)),
+            patch.object(bot, "get_or_create_user"),
+            patch.object(bot, "show_package_list", AsyncMock()) as packages,
+            patch.object(bot, "show_config_list", AsyncMock()) as configs,
+        ):
+            await bot.callback_handler(update, context)
+        packages.assert_awaited_once_with(query, "FULL", switch_banner=True)
+        configs.assert_not_awaited()
+
+    def test_legacy_aggregate_detail_callback_resolves_the_current_package(self):
+        first = vless(host="first.example.com", fragment="First")
+        second = vless(host="second.example.com", fragment="Second")
+        cache = {
+            "FULL_1.txt": {"count": 1, "content": "", "configs": [first]},
+            "FULL_2.txt": {"count": 1, "content": "", "configs": [second]},
+        }
+        chunks = {
+            "FULL.txt": [
+                ("FULL_1.txt", "one", 1),
+                ("FULL_2.txt", "two", 1),
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            for filename in cache:
+                (Path(directory) / filename).write_text("generated", encoding="utf-8")
+            with (
+                patch.object(bot, "DATA_DIR", Path(directory)),
+                patch.object(bot, "AGGREGATED_CACHE", cache),
+                patch.object(bot, "AGGREGATED_CHUNKS", chunks),
+            ):
+                resolved = bot.package_scope_for_token("FULL", bot.config_token(second))
+        self.assertEqual(resolved, "FULL_2.txt")
+
     async def test_config_result_edits_existing_caption_without_reuploading_banner(self):
         message = SimpleNamespace(
             photo=[SimpleNamespace()],
@@ -634,7 +713,7 @@ class ConfigConnectivityTests(unittest.IsolatedAsyncioTestCase):
         link = vless(fragment="Ping-Node")
         token = bot.config_token(link)
         query = SimpleNamespace(
-            data=f"cfgping:FULL:{token}:0",
+            data=f"cfgping:FULL_1.txt:{token}:0",
             from_user=SimpleNamespace(id=123, username="", first_name="User"),
             answer=AsyncMock(),
             message=SimpleNamespace(reply_text=AsyncMock()),
@@ -644,6 +723,11 @@ class ConfigConnectivityTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(bot, "is_user_subscribed", AsyncMock(return_value=True)),
             patch.object(bot, "get_or_create_user"),
+            patch.object(
+                bot,
+                "package_scope_for_token",
+                return_value="FULL_1.txt",
+            ),
             patch.object(
                 bot,
                 "show_config_detail",
@@ -1252,55 +1336,115 @@ class SourceRegistryTests(unittest.TestCase):
             ["sticker-id", "text-id", "caption-id"],
         )
 
-    def test_config_list_is_paginated_and_keeps_txt_delivery(self):
+    def test_package_first_navigation_scopes_config_list_and_keeps_txt_delivery(self):
         links = [
             vless(host=f"node{index}.example.com", fragment=f"Node-{index}")
-            for index in range(10)
+            for index in range(310)
         ]
-        with (
-            patch.object(
-                bot,
-                "AGGREGATED_CACHE",
-                {
-                    "FULL.txt": {
-                        "count": len(links),
-                        "content": "",
-                        "configs": links,
-                    }
-                },
-            ),
-            patch.dict(config.CUSTOM_EMOJI_IDS, {}, clear=True),
-        ):
-            keyboard = bot.config_list_keyboard("FULL", 0)
-            text = bot.config_list_text("FULL", 0)
+        cache = {
+            "FULL.txt": {"count": 310, "content": "", "configs": links},
+            "FULL_1.txt": {"count": 300, "content": "", "configs": links[:300]},
+            "FULL_2.txt": {"count": 10, "content": "", "configs": links[300:]},
+        }
+        chunks = {
+            "FULL.txt": [
+                ("FULL_1.txt", "one", 300),
+                ("FULL_2.txt", "two", 10),
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            for filename in cache:
+                (Path(directory) / filename).write_text("generated", encoding="utf-8")
+            with (
+                patch.object(bot, "DATA_DIR", Path(directory)),
+                patch.object(bot, "AGGREGATED_CACHE", cache),
+                patch.object(bot, "AGGREGATED_CHUNKS", chunks),
+                patch.dict(config.CUSTOM_EMOJI_IDS, {}, clear=True),
+            ):
+                package_keyboard = bot.package_list_keyboard("FULL")
+                package_text = bot.package_list_text("FULL")
+                keyboard = bot.config_list_keyboard("FULL_2.txt", 0)
+                text = bot.config_list_text("FULL_2.txt", 0)
+        package_buttons = [
+            button for row in package_keyboard.inline_keyboard for button in row
+        ]
+        self.assertEqual(
+            [
+                button.callback_data
+                for button in package_buttons
+                if (button.callback_data or "").startswith("pkgcfg:")
+            ],
+            ["pkgcfg:FULL_1.txt:0", "pkgcfg:FULL_2.txt:0"],
+        )
+        self.assertIn("Пакетов: <b>2</b>", package_text)
+        self.assertIn("до <b>300</b>", package_text)
+
         buttons = [button for row in keyboard.inline_keyboard for button in row]
         config_buttons = [
             button for button in buttons if (button.callback_data or "").startswith("cfgdetail:")
         ]
         self.assertEqual(len(config_buttons), bot.CONFIGS_PER_PAGE)
-        self.assertTrue(any((button.callback_data or "").startswith("cfglist:FULL:1") for button in buttons))
-        self.assertTrue(any(button.callback_data == "packages:FULL" for button in buttons))
+        self.assertTrue(all("FULL_2.txt" in button.callback_data for button in config_buttons))
+        self.assertTrue(any(button.callback_data == "pkgcfg:FULL_2.txt:1" for button in buttons))
+        self.assertTrue(any(button.callback_data == "rawfile:FULL_2.txt" for button in buttons))
+        self.assertTrue(any(button.callback_data == "pkglist:FULL" for button in buttons))
+        self.assertIn("пакет 2", text)
+        self.assertIn("Конфигов в пакете: <b>10</b>", text)
         self.assertIn("Страница: <b>1/2</b>", text)
         self.assertNotIn("vless://", " ".join(button.text for button in buttons))
-        self.assertTrue(all(button.style is None for button in buttons))
+        self.assertTrue(all(button.style is None for button in package_buttons + buttons))
+
+    def test_missing_generated_chunk_is_never_advertised(self):
+        link = vless(fragment="Only-Available")
+        cache = {
+            "FULL.txt": {"count": 2, "content": "", "configs": [link, link]},
+            "FULL_1.txt": {"count": 1, "content": "", "configs": [link]},
+            "FULL_99.txt": {"count": 1, "content": "", "configs": [link]},
+        }
+        chunks = {
+            "FULL.txt": [
+                ("FULL_1.txt", "one", 1),
+                ("FULL_99.txt", "two", 1),
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "FULL.txt").write_text("main", encoding="utf-8")
+            (Path(directory) / "FULL_1.txt").write_text("one", encoding="utf-8")
+            with (
+                patch.object(bot, "DATA_DIR", Path(directory)),
+                patch.object(bot, "AGGREGATED_CACHE", cache),
+                patch.object(bot, "AGGREGATED_CHUNKS", chunks),
+            ):
+                keyboard = bot.package_list_keyboard("FULL")
+                text = bot.package_list_text("FULL")
+        callbacks = [
+            button.callback_data
+            for row in keyboard.inline_keyboard
+            for button in row
+        ]
+        self.assertIn("pkgcfg:FULL_1.txt:0", callbacks)
+        self.assertNotIn("pkgcfg:FULL_99.txt:0", callbacks)
+        self.assertIn("Пакетов: <b>1</b>", text)
 
     def test_config_detail_has_in_message_tcp_ping_control(self):
         link = vless(fragment="Fast-Node")
+        cache = {
+            "FULL.txt": {"count": 1, "content": "", "configs": [link]},
+            "FULL_1.txt": {"count": 1, "content": "", "configs": [link]},
+        }
+        chunks = {"FULL.txt": [("FULL_1.txt", "one", 1)]}
         with (
-            patch.object(
-                bot,
-                "AGGREGATED_CACHE",
-                {"FULL.txt": {"count": 1, "content": "", "configs": [link]}},
-            ),
+            patch.object(bot, "AGGREGATED_CACHE", cache),
+            patch.object(bot, "AGGREGATED_CHUNKS", chunks),
             patch.dict(config.CUSTOM_EMOJI_IDS, {}, clear=True),
         ):
-            text = bot.config_detail_text("FULL", link, 0, ping_status=42)
-            keyboard = bot.config_detail_keyboard("FULL", link, 0)
+            text = bot.config_detail_text("FULL_1.txt", link, 0, ping_status=42)
+            keyboard = bot.config_detail_keyboard("FULL_1.txt", link, 0)
         self.assertIn("TCP-соединение установлено", text)
         self.assertIn("42 мс", text)
         self.assertNotIn("vless://", text)
         ping_button = keyboard.inline_keyboard[0][0]
-        self.assertTrue(ping_button.callback_data.startswith("cfgping:FULL:"))
+        self.assertTrue(ping_button.callback_data.startswith("cfgping:FULL_1.txt:"))
         self.assertIsNone(ping_button.style)
 
     def test_admin_panel_displays_current_unique_vless_count(self):

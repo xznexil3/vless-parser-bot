@@ -897,37 +897,6 @@ async def paid_successful_payment_handler(update: Update, context: ContextTypes.
         )
 
 
-def chunks_keyboard(
-    base_filename: str,
-    chunk_list,
-    back_data: str = "home",
-    back_label: str = "«Назад»",
-):
-    rows = []
-    for _, (cfname, _, cnt) in enumerate(chunk_list, 1):
-        short = cfname.replace(".txt", "")
-        chunk_button = ui_button(
-            "chunk",
-            f"«{short} · {cnt}»",
-            callback_data=f"chunk:{cfname}",
-        )
-        if not rows or len(rows[-1]) == 2:
-            rows.append([chunk_button])
-        else:
-            rows[-1].append(chunk_button)
-    rows.append([
-        ui_button(
-            "download",
-            "«Скачать полный файл»",
-            callback_data=f"rawfile:{base_filename}",
-        )
-    ])
-    rows.append([
-        ui_button("back", back_label, callback_data=back_data)
-    ])
-    return InlineKeyboardMarkup(rows)
-
-
 def aggregate_for_filename(filename: str):
     """Resolve an aggregate or numbered chunk, including old button names."""
     for aggregate_key, aggregate in config.AGGREGATED_SUBS.items():
@@ -977,11 +946,68 @@ def aggregate_back_target(agg_key: str) -> str:
     return candidate if candidate in {"white", "black", "full"} else "home"
 
 
-def aggregate_configs(agg_key: str) -> list[str]:
+def config_scope_configs(filename: str) -> list[str]:
+    """Return configs from one generated package, never the whole aggregate implicitly."""
+    if not aggregate_for_filename(filename)[1]:
+        return []
+    return list(AGGREGATED_CACHE.get(filename, {}).get("configs", []))
+
+
+def package_list_keyboard(agg_key: str) -> InlineKeyboardMarkup:
     aggregate = config.AGGREGATED_SUBS.get(agg_key)
     if not aggregate:
-        return []
-    return list(AGGREGATED_CACHE.get(aggregate["filename"], {}).get("configs", []))
+        return back_keyboard("home")
+    base_filename = aggregate["filename"]
+    rows = []
+    for index, (filename, _, count) in enumerate(
+        AGGREGATED_CHUNKS.get(base_filename, []),
+        1,
+    ):
+        # Never advertise a package unless its active generated file exists.
+        if filename not in AGGREGATED_CACHE or local_subscription_path(filename) is None:
+            continue
+        rows.append([
+            ui_button(
+                "chunk",
+                f"«Пакет {index} · {count} конфигов»",
+                callback_data=f"pkgcfg:{filename}:0",
+            )
+        ])
+    rows.append([
+        ui_button(
+            "back",
+            "«Назад»",
+            callback_data=aggregate_back_target(agg_key),
+        )
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def package_list_text(agg_key: str) -> str:
+    aggregate = config.AGGREGATED_SUBS.get(agg_key, {})
+    base_filename = aggregate.get("filename", "")
+    chunks = AGGREGATED_CHUNKS.get(base_filename, [])
+    available_count = sum(
+        filename in AGGREGATED_CACHE and local_subscription_path(filename) is not None
+        for filename, _, _ in chunks
+    )
+    total = AGGREGATED_CACHE.get(base_filename, {}).get("count", 0)
+    return (
+        f"<b>📦 {html.escape(str(aggregate.get('profile_title', 'VLESS-пакеты')))}</b>\n\n"
+        f"Всего конфигов: <b>{total}</b>\n"
+        f"Пакетов: <b>{available_count}</b>\n\n"
+        f"В каждом пакете до <b>{CHUNK_SIZE}</b> конфигов. Открой пакет, чтобы "
+        "посмотреть его конфиги, проверить соединение или скачать этот .txt-файл."
+    )
+
+
+async def show_package_list(query, agg_key: str, *, switch_banner: bool = False):
+    text = package_list_text(agg_key)
+    keyboard = package_list_keyboard(agg_key)
+    if switch_banner:
+        await edit_message_with_banner(query, "configs", text, keyboard)
+    else:
+        await edit_config_message_content(query, text, keyboard)
 
 
 def current_vless_count() -> int:
@@ -1025,22 +1051,80 @@ def config_token(link: str) -> str:
     return hashlib.sha256(link.encode("utf-8")).hexdigest()[:12]
 
 
-def config_by_token(agg_key: str, token: str):
-    for index, link in enumerate(aggregate_configs(agg_key)):
+def is_active_package(filename: str) -> bool:
+    aggregate_key, aggregate = aggregate_for_filename(filename)
+    if not aggregate_key or not aggregate or filename == aggregate["filename"]:
+        return False
+    return (
+        any(
+            current_filename == filename
+            for current_filename, _, _ in AGGREGATED_CHUNKS.get(aggregate["filename"], [])
+        )
+        and filename in AGGREGATED_CACHE
+        and local_subscription_path(filename) is not None
+    )
+
+
+def package_scope_for_token(scope: str, token: str = "") -> str | None:
+    """Resolve a package filename and migrate callbacks from previous generations."""
+    if is_active_package(scope) and (
+        not token
+        or any(config_token(link) == token for link in config_scope_configs(scope))
+    ):
+        return scope
+    aggregate_key, aggregate = aggregate_for_filename(scope)
+    if not aggregate:
+        aggregate_key = scope if scope in config.AGGREGATED_SUBS else None
+        aggregate = config.AGGREGATED_SUBS.get(scope)
+    if not aggregate_key or not aggregate:
+        return None
+    chunks = AGGREGATED_CHUNKS.get(aggregate["filename"], [])
+    if token:
+        for filename, _, _ in chunks:
+            if (
+                is_active_package(filename)
+                and any(
+                    config_token(link) == token
+                    for link in config_scope_configs(filename)
+                )
+            ):
+                return filename
+    return next(
+        (filename for filename, _, _ in chunks if is_active_package(filename)),
+        None,
+    )
+
+
+def package_list_callback(filename: str) -> str:
+    aggregate_key, _ = aggregate_for_filename(filename)
+    return f"pkglist:{aggregate_key}" if aggregate_key else "home"
+
+
+def file_return_callback(filename: str) -> str:
+    aggregate_key, aggregate = aggregate_for_filename(filename)
+    if not aggregate_key or not aggregate:
+        return "home"
+    if filename == aggregate["filename"]:
+        return f"pkglist:{aggregate_key}"
+    return f"pkgcfg:{filename}:0"
+
+
+def config_by_token(filename: str, token: str):
+    for index, link in enumerate(config_scope_configs(filename)):
         if config_token(link) == token:
             return index, link
     return None, None
 
 
-def _config_page(agg_key: str, requested_page: int) -> tuple[list[str], int, int]:
-    configs = aggregate_configs(agg_key)
+def _config_page(filename: str, requested_page: int) -> tuple[list[str], int, int]:
+    configs = config_scope_configs(filename)
     page_count = max(1, (len(configs) + CONFIGS_PER_PAGE - 1) // CONFIGS_PER_PAGE)
     page = max(0, min(requested_page, page_count - 1))
     return configs, page, page_count
 
 
-def config_list_keyboard(agg_key: str, requested_page: int = 0) -> InlineKeyboardMarkup:
-    configs, page, page_count = _config_page(agg_key, requested_page)
+def config_list_keyboard(filename: str, requested_page: int = 0) -> InlineKeyboardMarkup:
+    configs, page, page_count = _config_page(filename, requested_page)
     start = page * CONFIGS_PER_PAGE
     rows = []
     for index, link in enumerate(configs[start:start + CONFIGS_PER_PAGE], start=start):
@@ -1054,7 +1138,7 @@ def config_list_keyboard(agg_key: str, requested_page: int = 0) -> InlineKeyboar
             ui_button(
                 "vless",
                 f"«{index + 1}. {name}»",
-                callback_data=f"cfgdetail:{agg_key}:{config_token(link)}:{page}",
+                callback_data=f"cfgdetail:{filename}:{config_token(link)}:{page}",
             )
         ])
     navigation = []
@@ -1062,52 +1146,59 @@ def config_list_keyboard(agg_key: str, requested_page: int = 0) -> InlineKeyboar
         navigation.append(ui_button(
             "back",
             "«Предыдущая»",
-            callback_data=f"cfglist:{agg_key}:{page - 1}",
+            callback_data=f"pkgcfg:{filename}:{page - 1}",
         ))
     if page + 1 < page_count:
         navigation.append(ui_button(
             "next",
             "«Следующая»",
-            callback_data=f"cfglist:{agg_key}:{page + 1}",
+            callback_data=f"pkgcfg:{filename}:{page + 1}",
         ))
     if navigation:
         rows.append(navigation)
-    rows.append([
-        ui_button(
-            "download",
-            "«Скачать .txt-пакеты»",
-            callback_data=f"packages:{agg_key}",
-        )
-    ])
+    if filename in AGGREGATED_CACHE and local_subscription_path(filename) is not None:
+        rows.append([
+            ui_button(
+                "download",
+                "«Скачать этот .txt»",
+                callback_data=f"rawfile:{filename}",
+            )
+        ])
     rows.append([
         ui_button(
             "back",
-            "«К спискам»",
-            callback_data=aggregate_back_target(agg_key),
+            "«К пакетам»",
+            callback_data=package_list_callback(filename),
         )
     ])
     return InlineKeyboardMarkup(rows)
 
 
-def config_list_text(agg_key: str, requested_page: int = 0) -> str:
-    aggregate = config.AGGREGATED_SUBS.get(agg_key, {})
-    configs, page, page_count = _config_page(agg_key, requested_page)
+def config_list_text(filename: str, requested_page: int = 0) -> str:
+    _, aggregate = aggregate_for_filename(filename)
+    configs, page, page_count = _config_page(filename, requested_page)
+    chunks = AGGREGATED_CHUNKS.get(aggregate["filename"], []) if aggregate else []
+    package_number = next(
+        (index for index, (name, _, _) in enumerate(chunks, 1) if name == filename),
+        1,
+    )
+    title = aggregate.get("profile_title", "VLESS-конфиги") if aggregate else "VLESS-конфиги"
     return (
-        f"<b>🧾 {html.escape(str(aggregate.get('profile_title', 'VLESS-конфиги')))}</b>\n\n"
-        f"Всего конфигов: <b>{len(configs)}</b>\n"
+        f"<b>🧾 {html.escape(str(title))} — пакет {package_number}</b>\n\n"
+        f"Конфигов в пакете: <b>{len(configs)}</b>\n"
         f"Страница: <b>{page + 1}/{page_count}</b>\n\n"
         "Выбери конфиг, чтобы посмотреть параметры и проверить соединение."
     )
 
 
 def config_detail_text(
-    agg_key: str,
+    filename: str,
     link: str,
     index: int,
     *,
     ping_status=None,
 ) -> str:
-    configs = aggregate_configs(agg_key)
+    configs = config_scope_configs(filename)
     info = parse_vless_info(link)
     raw_remark = str(info.get("remark") or "Без названия")
     if info.get("error") or raw_remark.lower().startswith("vless://"):
@@ -1139,7 +1230,7 @@ def config_detail_text(
 
 
 def config_detail_keyboard(
-    agg_key: str,
+    filename: str,
     link: str,
     page: int,
 ) -> InlineKeyboardMarkup:
@@ -1148,12 +1239,12 @@ def config_detail_keyboard(
         [ui_button(
             "ping",
             "«Проверить соединение»",
-            callback_data=f"cfgping:{agg_key}:{token}:{page}",
+            callback_data=f"cfgping:{filename}:{token}:{page}",
         )],
         [ui_button(
             "back",
             "«К списку конфигов»",
-            callback_data=f"cfglist:{agg_key}:{page}",
+            callback_data=f"pkgcfg:{filename}:{page}",
         )],
     ])
 
@@ -1181,35 +1272,34 @@ async def edit_config_message_content(query, text: str, reply_markup):
 
 async def show_config_list(
     query,
-    agg_key: str,
+    filename: str,
     page: int = 0,
     *,
     switch_banner: bool = False,
 ):
-    text = config_list_text(agg_key, page)
-    keyboard = config_list_keyboard(agg_key, page)
+    text = config_list_text(filename, page)
+    keyboard = config_list_keyboard(filename, page)
     if switch_banner:
         await edit_message_with_banner(query, "configs", text, keyboard)
     else:
         await edit_config_message_content(query, text, keyboard)
 
 
-async def show_config_detail(query, agg_key: str, token: str, page: int, ping_status=None):
-    index, link = config_by_token(agg_key, token)
+async def show_config_detail(query, filename: str, token: str, page: int, ping_status=None):
+    index, link = config_by_token(filename, token)
     if link is None:
         await edit_config_message_content(
             query,
-            "<b>⚠️ Конфиг больше не найден</b>\n\nСписки успели обновиться. Открой актуальную страницу.",
-            back_keyboard(f"cfglist:{agg_key}:{page}"),
+            "<b>⚠️ Конфиг больше не найден</b>\n\nСписки успели обновиться. Открой актуальный пакет.",
+            back_keyboard(f"pkgcfg:{filename}:{page}"),
         )
         return None
     await edit_config_message_content(
         query,
-        config_detail_text(agg_key, link, index, ping_status=ping_status),
-        config_detail_keyboard(agg_key, link, page),
+        config_detail_text(filename, link, index, ping_status=ping_status),
+        config_detail_keyboard(filename, link, page),
     )
     return link
-
 
 # ---------- Channel subscription check ----------
 
@@ -1263,8 +1353,16 @@ def build_aggregated_configs():
             )
             results[filename] = {"content": full_content, "count": len(all_cfgs), "configs": all_cfgs}
             chunk_list = []
+            chunk_offset = 0
             for cfname, ctitle, cnt, ccontent in chunk_infos:
-                results[cfname] = {"content": ccontent, "count": cnt, "configs": [], "is_chunk": True}
+                chunk_configs = all_cfgs[chunk_offset:chunk_offset + cnt]
+                chunk_offset += cnt
+                results[cfname] = {
+                    "content": ccontent,
+                    "count": cnt,
+                    "configs": chunk_configs,
+                    "is_chunk": True,
+                }
                 chunk_list.append((cfname, ctitle, cnt))
             chunk_map[filename] = chunk_list
             proto_counts_map[filename] = {"vless": len(all_cfgs)}
@@ -1426,10 +1524,13 @@ async def _update_cache(categories=None, mode=None, bot=None):
 def local_subscription_path(filename: str):
     """Return an active generated file or, before preload, a bootstrap copy."""
     _, aggregate = aggregate_for_filename(filename)
-    if aggregate and AGGREGATED_CACHE and filename not in AGGREGATED_CACHE:
-        # The name belongs to an old aggregate generation. Do not silently
-        # serve a stale committed chunk after the active map has switched.
-        return None
+    if aggregate and AGGREGATED_CACHE:
+        if filename not in AGGREGATED_CACHE:
+            # The name belongs to an old aggregate generation. Do not silently
+            # serve a stale committed chunk after the active map has switched.
+            return None
+        generated_path = DATA_DIR / filename
+        return generated_path if generated_path.is_file() else None
     for path in (DATA_DIR / filename, Path(__file__).parent.parent / filename):
         if path.is_file():
             return path
@@ -1592,20 +1693,14 @@ async def handle_main_menu_text(update: Update, context: ContextTypes.DEFAULT_TY
     return False
 
 async def show_outdated_file(query, fname: str, back_data: str = "home"):
-    _, aggregate = aggregate_for_filename(fname)
+    aggregate_key, aggregate = aggregate_for_filename(fname)
     if aggregate:
-        base_filename = aggregate["filename"]
-        current_chunks = AGGREGATED_CHUNKS.get(base_filename, [])
         text = (
             f"<b>⚠️ {fname} больше не существует</b>\n\n"
             "Количество конфигураций изменилось, поэтому пакеты были пересобраны. "
             "Выбери актуальный пакет ниже."
         )
-        keyboard = (
-            chunks_keyboard(base_filename, current_chunks, back_data=back_data)
-            if current_chunks
-            else back_keyboard(back_data)
-        )
+        keyboard = package_list_keyboard(aggregate_key)
     else:
         text = "<b>⚠️ Файл больше не существует</b>\n\nОткрой список заново."
         keyboard = back_keyboard(back_data)
@@ -2479,42 +2574,92 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if proto != "all" or agg_key not in config.AGGREGATED_SUBS:
             await query.message.reply_text("Неизвестный список")
             return
-        await show_config_list(query, agg_key, 0, switch_banner=True)
+        await show_package_list(query, agg_key, switch_banner=True)
         return
 
-    if data.startswith("cfglist:"):
-        try:
-            _, agg_key, page_text = data.split(":", 2)
-            page = int(page_text)
-        except (TypeError, ValueError):
-            await query.message.reply_text("Некорректная страница конфигов.")
-            return
+    if data.startswith("pkglist:") or data.startswith("packages:"):
+        agg_key = data.split(":", 1)[1]
         if agg_key not in config.AGGREGATED_SUBS:
             await query.message.reply_text("Неизвестный список")
             return
-        await show_config_list(query, agg_key, page)
+        await show_package_list(query, agg_key)
+        return
+
+    if data.startswith("pkgcfg:"):
+        try:
+            _, filename, page_text = data.split(":", 2)
+            page = int(page_text)
+        except (TypeError, ValueError):
+            await query.message.reply_text("Некорректная страница пакета.")
+            return
+        if not is_active_package(filename):
+            aggregate_key, _ = aggregate_for_filename(filename)
+            if aggregate_key:
+                await show_package_list(query, aggregate_key)
+            else:
+                await query.message.reply_text("Пакет больше не существует.")
+            return
+        await show_config_list(query, filename, page)
+        return
+
+    # Compatibility with config-list buttons from the previous aggregate-wide UI.
+    if data.startswith("cfglist:"):
+        try:
+            _, agg_key, page_text = data.split(":", 2)
+            old_page = max(0, int(page_text))
+        except (TypeError, ValueError):
+            await query.message.reply_text("Некорректная страница конфигов.")
+            return
+        aggregate = config.AGGREGATED_SUBS.get(agg_key)
+        if not aggregate:
+            await query.message.reply_text("Неизвестный список")
+            return
+        chunks = AGGREGATED_CHUNKS.get(aggregate["filename"], [])
+        global_offset = old_page * CONFIGS_PER_PAGE
+        chunk_index = min(global_offset // CHUNK_SIZE, max(0, len(chunks) - 1))
+        if not chunks:
+            await show_package_list(query, agg_key)
+            return
+        filename = chunks[chunk_index][0]
+        if not is_active_package(filename):
+            await show_package_list(query, agg_key)
+            return
+        local_page = (global_offset - chunk_index * CHUNK_SIZE) // CONFIGS_PER_PAGE
+        await show_config_list(query, filename, local_page)
         return
 
     if data.startswith("cfgdetail:"):
         try:
-            _, agg_key, token, page_text = data.split(":", 3)
+            _, scope, token, page_text = data.split(":", 3)
             page = int(page_text)
         except (TypeError, ValueError):
             await query.message.reply_text("Некорректный конфиг.")
             return
-        await show_config_detail(query, agg_key, token, page)
+        filename = package_scope_for_token(scope, token)
+        if not filename:
+            aggregate_key = scope if scope in config.AGGREGATED_SUBS else None
+            if aggregate_key:
+                await show_package_list(query, aggregate_key)
+            else:
+                await query.message.reply_text("Конфиг или пакет больше не найден.")
+            return
+        await show_config_detail(query, filename, token, page)
         return
 
     if data.startswith("cfgping:"):
         try:
-            _, agg_key, token, page_text = data.split(":", 3)
+            _, scope, token, page_text = data.split(":", 3)
             page = int(page_text)
         except (TypeError, ValueError):
             await query.message.reply_text("Некорректный конфиг.")
             return
+        filename = package_scope_for_token(scope, token)
+        if not filename:
+            await query.message.reply_text("Конфиг или пакет больше не найден.")
+            return
         link = await show_config_detail(
             query,
-            agg_key,
+            filename,
             token,
             page,
             ping_status="checking",
@@ -2533,62 +2678,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await show_config_detail(
             query,
-            agg_key,
+            filename,
             token,
             page,
             ping_status=latency_ms if latency_ms is not None else "failed",
         )
         return
 
-    if data.startswith("packages:"):
-        agg_key = data.split(":", 1)[1]
-        agg = config.AGGREGATED_SUBS.get(agg_key)
-        if not agg:
-            await query.message.reply_text("Неизвестный список")
-            return
-        fname = agg["filename"]
-        chunks = AGGREGATED_CHUNKS.get(fname, [])
-        cnt = AGGREGATED_CACHE.get(fname, {}).get("count", "?")
-        text = (
-            f"<b>📦 {html.escape(agg['profile_title'])}</b>\n\n"
-            f"🔗 Всего VLESS: <b>{cnt}</b>\n\n"
-            "Выбери пакет — бот отправит готовый <code>.txt</code>-файл."
-        )
-        list_callback = f"cfglist:{agg_key}:0"
-        if chunks:
-            kb = chunks_keyboard(
-                fname,
-                chunks,
-                back_data=list_callback,
-                back_label="«К списку конфигов»",
-            )
-        else:
-            kb = InlineKeyboardMarkup([
-                [ui_button(
-                    "download",
-                    "«Скачать .txt»",
-                    callback_data=f"rawfile:{fname}",
-                )],
-                [ui_button(
-                    "back",
-                    "«К списку конфигов»",
-                    callback_data=list_callback,
-                )],
-            ])
-        await edit_message_with_banner(query, "configs", text, kb)
-        return
-
     if data.startswith("chunk:"):
         fname = data.split(":", 1)[1]
-        aggregate_key, _ = aggregate_for_filename(fname)
         await send_chunk_file(
             query,
             fname,
-            back_data=(
-                f"cfglist:{aggregate_key}:0"
-                if aggregate_key
-                else aggregate_back_callback(fname)
-            ),
+            back_data=file_return_callback(fname),
         )
         return
 
@@ -2596,15 +2698,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # link/base64/QR action now sends the corresponding .txt file instead.
     if data.startswith(("rawcopy:", "b64copy:", "qrfile:", "rawfile:")):
         fname = data.split(":", 1)[1]
-        aggregate_key, _ = aggregate_for_filename(fname)
         await send_chunk_file(
             query,
             fname,
-            back_data=(
-                f"cfglist:{aggregate_key}:0"
-                if aggregate_key
-                else aggregate_back_callback(fname)
-            ),
+            back_data=file_return_callback(fname),
         )
         return
 
