@@ -1,6 +1,7 @@
 import json
 import os
 from dotenv import load_dotenv
+from provider_registry import load_provider_registry
 
 load_dotenv()
 
@@ -155,21 +156,70 @@ SOURCES = {
 if not AUTO_DISCOVERY:
     SOURCES.pop("github_discovery", None)
 
-WHITE_SOURCE_KEYS = [
+STATIC_WHITE_SOURCE_KEYS = (
     "zieng2",
     "igareck",
     "cid_vpn",
     "byewhitelists2",
     "ghost_vpn",
-]
-BLACK_SOURCE_KEYS = [
+)
+STATIC_BLACK_SOURCE_KEYS = (
     "igareck_black",
     "ghost_vpn_black",
     "aetris_vpn",
-]
-if AUTO_DISCOVERY:
-    BLACK_SOURCE_KEYS.append("github_discovery")
+    *(("github_discovery",) if AUTO_DISCOVERY else ()),
+)
+STATIC_SOURCE_KEYS = frozenset(SOURCES)
+WHITE_SOURCE_KEYS = list(STATIC_WHITE_SOURCE_KEYS)
+BLACK_SOURCE_KEYS = list(STATIC_BLACK_SOURCE_KEYS)
 FULL_SOURCE_KEYS = WHITE_SOURCE_KEYS + BLACK_SOURCE_KEYS
+DYNAMIC_PROVIDER_RECORDS = []
+
+
+def apply_dynamic_providers(records=None):
+    """Atomically rebuild runtime source lists from the persistent registry."""
+    global DYNAMIC_PROVIDER_RECORDS
+    if records is None:
+        records = load_provider_registry()
+    records = [record for record in records if isinstance(record, dict)]
+
+    for key in list(SOURCES):
+        if key not in STATIC_SOURCE_KEYS:
+            SOURCES.pop(key, None)
+    WHITE_SOURCE_KEYS[:] = STATIC_WHITE_SOURCE_KEYS
+    BLACK_SOURCE_KEYS[:] = STATIC_BLACK_SOURCE_KEYS
+
+    accepted = []
+    for record in records:
+        source_key = str(record.get("id", ""))
+        urls = list(record.get("urls", []))
+        category = record.get("category")
+        if not source_key.startswith("dynamic_") or not urls or category not in {"white", "black"}:
+            continue
+        accepted.append(record)
+        if not record.get("enabled", True):
+            continue
+        SOURCES[source_key] = {
+            "name": str(record.get("name") or source_key),
+            "description": str(record.get("description") or "Публичный GitHub VLESS feed"),
+            "url_strategy": "all",
+            "urls": urls,
+            "dynamic": True,
+        }
+        target = WHITE_SOURCE_KEYS if category == "white" else BLACK_SOURCE_KEYS
+        if source_key not in target:
+            target.append(source_key)
+
+    FULL_SOURCE_KEYS[:] = [*WHITE_SOURCE_KEYS, *BLACK_SOURCE_KEYS]
+    DYNAMIC_PROVIDER_RECORDS = accepted
+    if "AGGREGATED_SUBS" in globals():
+        AGGREGATED_SUBS["WHITE_FULL"]["source_keys"] = WHITE_SOURCE_KEYS
+        AGGREGATED_SUBS["BLACK_FULL"]["source_keys"] = BLACK_SOURCE_KEYS
+        AGGREGATED_SUBS["FULL"]["source_keys"] = FULL_SOURCE_KEYS
+    return list(DYNAMIC_PROVIDER_RECORDS)
+
+
+apply_dynamic_providers()
 
 AGGREGATED_SUBS = {
     "BLACK_FULL": {
@@ -228,6 +278,6 @@ HELP_TEXT = f"""<b>❔ Free VPN • Crimson — помощь</b>
 
 SOURCES_TEXT = """<b>🗂️ Источники VLESS</b>
 
-Используются только GitHub feed-ы: zieng2, igareck, CID VPN, ByeWhiteLists 2.0, Ghost VPN, AetrisVPN и строгий GitHub-поиск.
+Используются только GitHub feed-ы: zieng2, igareck, CID VPN, ByeWhiteLists 2.0, Ghost VPN, AetrisVPN, одобренные администратором провайдеры и строгий GitHub-поиск.
 
-🔎 Поиск учитывает слова VLESS, VPN, config, list и blacklist. Широкие collection/index-источники отключены. Из файлов принимаются только корректные <b>VLESS</b>; дубликаты удаляются."""
+🔎 Поиск учитывает слова VLESS, VPN, config, subscription, list и blacklist. Широкие collection/index-источники отключены. Из файлов принимаются только корректные <b>VLESS</b>; дубликаты удаляются."""

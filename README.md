@@ -14,6 +14,20 @@ Telegram-бот собирает публичные VLESS-конфигураци
 
 Дополнительный строгий `github_discovery` использует GitHub Repository Search и Git Tree API. Репозиторий и путь файла должны одновременно соответствовать VLESS и дополнительным фильтрам `vpn`, `config`, `subscription`, `list` или `blacklist`. Берётся не больше одного feed-а из одного репозитория, максимум 8 feed-ов и 1200 уникальных конфигураций за обновление. Каждый найденный feed принимается только при наличии минимум 10 валидных VLESS.
 
+### Управление провайдерами из бота
+
+В админ-панели доступны «Провайдеры» и «Поиск источников»:
+
+- поиск показывает только публичные GitHub-файлы и число валидных VLESS;
+- каждый кандидат требует явного подтверждения: «Добавить в белые», «Добавить в черные» или «Пропустить»;
+- вручную можно отправить прямую GitHub/raw-ссылку на текстовый feed или ссылку на публичный GitHub-репозиторий;
+- для репозитория бот ограниченно проверяет наиболее подходящие `.txt`, `.conf`, `.list`, `.json`, `.yaml` и `.yml` файлы;
+- динамический provider можно включить, выключить или удалить; одновременно хранится не более 20 динамических провайдеров;
+- реестр хранится в `providers.json` и при наличии токена публикуется в GitHub без force-push, поэтому переживает Railway redeploy;
+- для записи реестра `GITHUB_TOKEN` должен иметь доступ на запись Contents к `GITHUB_REPO`; без него изменение применяется локально, а бот явно предупреждает, что оно может исчезнуть после redeploy.
+
+Закрытые, платные, украденные и требующие чужой авторизации subscription-ссылки не ищутся и не принимаются. Смешанные публичные feed-ы дают только прошедшие проверку VLESS.
+
 ## ✅ Извлечение и проверка
 
 Парсер работает только с VLESS и извлекает URI из:
@@ -61,6 +75,8 @@ TCP-проверка подтверждает доступность endpoint-а
 - встроенная поддержка: пользователь пишет в бот, администратор отвечает через защищённый relay без публикации личного username;
 - включение и выключение уведомлений в админ-панели;
 - замена предыдущего уведомления о списках новым сообщением после каждого обновления;
+- поиск публичных GitHub VLESS-feed-ов с ручным подтверждением администратора;
+- добавление GitHub-файлов и репозиториев, включение, выключение и удаление динамических провайдеров;
 - ручная строгая проверка одного вставленного VLESS URI;
 - отсутствие пользовательских subscription-ссылок: конфигурации выдаются файлами.
 
@@ -122,7 +138,7 @@ docker logs -f vless-parser-bot
 | `DISCOVERY_MAX_FEEDS` | Максимум найденных файлов за обновление | `8` |
 | `DISCOVERY_MIN_VALID` | Минимум валидных VLESS для принятия feed-а | `10` |
 | `DISCOVERY_MAX_CONFIGS` | Максимум конфигураций из автопоиска | `1200` |
-| `GITHUB_TOKEN` | Токен для публикации агрегатов | — |
+| `GITHUB_TOKEN` | Fine-grained токен с Contents read/write для агрегатов и `providers.json` | — |
 | `GITHUB_REPO` | Репозиторий агрегатов | `xznexil3/vless-parser-bot` |
 | `GITHUB_BRANCH` | Ветка публикации `.txt`-файлов | `main` |
 | `PORT` | Порт Railway health-сервера | `8080` |
@@ -130,7 +146,7 @@ docker logs -f vless-parser-bot
 ## 🧠 Pipeline
 
 ```text
-selected GitHub feeds + strict filtered GitHub discovery
+selected GitHub feeds + approved providers.json + strict filtered GitHub discovery
   → bounded fetch
   → plain / escaped / base64 extraction
   → strict VLESS validation
@@ -148,7 +164,7 @@ python -m unittest discover -s tests -v
 python -m py_compile src/*.py tests/*.py
 ```
 
-Тесты покрывают plain/base64/escaped extraction входных данных, VLESS/Reality validation, private host rejection, normalized deduplication, строгие GitHub-фильтры, лимиты discovery, endpoint check deduplication, файловый интерфейс, цветовые стили кнопок и очистку устаревших chunks.
+Тесты покрывают plain/base64/escaped extraction входных данных, VLESS/Reality validation, private host rejection, normalized deduplication, строгие GitHub-фильтры, лимиты discovery, нормализацию GitHub provider-ссылок, реестр динамических провайдеров, endpoint check deduplication, файловый интерфейс, цветовые стили кнопок и очистку устаревших chunks.
 
 ## 📂 Структура
 
@@ -158,9 +174,11 @@ vless-parser-bot/
 │   ├── bot.py          # Telegram-бот и admin cleanup
 │   ├── ui.py           # Unicode-эмодзи и Premium-free кнопки
 │   ├── config.py       # источники, зеркала и агрегаты
-│   ├── parser.py       # fetch/extract/validate/dedup/TCP
-│   ├── subscription.py # atomic `.txt`/chunk generation
-│   └── health.py       # Railway health-check only
+│   ├── parser.py            # fetch/extract/validate/dedup/TCP
+│   ├── provider_registry.py # GitHub-only dynamic provider registry
+│   ├── subscription.py      # atomic `.txt`/chunk generation
+│   └── health.py            # Railway health-check only
+├── providers.json           # persistent providers managed from the bot
 ├── tests/
 │   └── test_parser.py
 ├── data/               # runtime-файлы

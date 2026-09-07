@@ -19,7 +19,13 @@ from config import (
     DISCOVERY_MAX_REPOS,
     DISCOVERY_MIN_VALID,
     GITHUB_REPO,
+    GITHUB_TOKEN,
     SOURCES,
+)
+from provider_registry import (
+    ALLOWED_FILE_SUFFIXES,
+    normalize_github_raw_url,
+    parse_github_repository_url,
 )
 
 # Delimiters here are not legal unescaped URI data and commonly surround links
@@ -435,10 +441,18 @@ def extract_configs(text: str, proto_filter: str = "vless") -> List[str]:
     return found
 
 
-async def fetch_text(session: aiohttp.ClientSession, url: str) -> str:
+async def fetch_text(
+    session: aiohttp.ClientSession,
+    url: str,
+    request_headers: Optional[Dict[str, str]] = None,
+) -> str:
     """Fetch one provider payload, returning an empty string on failure."""
     try:
-        async with session.get(url, headers=HEADERS, timeout=FETCH_TIMEOUT) as response:
+        async with session.get(
+            url,
+            headers=request_headers or HEADERS,
+            timeout=FETCH_TIMEOUT,
+        ) as response:
             if response.status != 200:
                 print(f"[fetch] {url} -> {response.status}")
                 return ""
@@ -500,7 +514,15 @@ def _discovery_url_score(url: str) -> int:
 
 
 async def _fetch_json(session: aiohttp.ClientSession, url: str):
-    text = await fetch_text(session, url)
+    headers = dict(HEADERS)
+    if GITHUB_TOKEN and (urlsplit(url).hostname or "").lower() == "api.github.com":
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+        headers["Accept"] = "application/vnd.github+json"
+        headers["X-GitHub-Api-Version"] = "2022-11-28"
+    text = await fetch_text(session, url, request_headers=headers)
+    if not text and "Authorization" in headers:
+        # A revoked/expired publication token must not disable public discovery.
+        text = await fetch_text(session, url, request_headers=HEADERS)
     if not text:
         return None
     try:
@@ -613,6 +635,187 @@ async def discover_github_feed_urls(
         if len(unique) >= DISCOVERY_MAX_FEEDS:
             break
     return unique, errors
+
+
+def _repository_file_score(repository: str, path: str) -> int:
+    """Rank bounded text candidates inside an admin-supplied GitHub repo."""
+    filename = path.rsplit("/", 1)[-1].lower()
+    stem, dot, suffix = filename.rpartition(".")
+    suffix = f".{suffix}" if dot else ""
+    if suffix not in ALLOWED_FILE_SUFFIXES:
+        return -100
+    tokens = set(re.split(r"[^a-z0-9]+", f"{repository}/{path}".lower()))
+    if tokens & DISCOVERY_EXCLUDED_NAMES:
+        return -100
+    weights = {
+        "vless": 50,
+        "vpn": 20,
+        "config": 16,
+        "configs": 16,
+        "subscription": 14,
+        "subscriptions": 14,
+        "sub": 8,
+        "list": 10,
+        "blacklist": 12,
+        "proxy": 5,
+    }
+    score = sum(weight for token, weight in weights.items() if token in tokens)
+    if not tokens.intersection(weights):
+        return -100
+    if suffix == ".txt":
+        score += 8
+    if stem in {"all", "full", "general", "vless", "configs", "config"}:
+        score += 4
+    return score
+
+
+async def discover_github_repository_feed_urls(
+    session: aiohttp.ClientSession,
+    repository_url: str,
+    limit: int = 12,
+) -> Tuple[List[str], List[str]]:
+    """Return bounded candidate files from an explicitly supplied GitHub repo."""
+    repository_parts = parse_github_repository_url(repository_url)
+    if not repository_parts:
+        return [], ["Некорректная ссылка на публичный GitHub-репозиторий"]
+    owner, repository_name = repository_parts
+    full_name = f"{owner}/{repository_name}"
+    metadata = await _fetch_json(session, f"https://api.github.com/repos/{full_name}")
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("archived")
+        or metadata.get("disabled")
+        or metadata.get("private")
+    ):
+        return [], [f"{full_name} — репозиторий недоступен или не является публичным"]
+    branch = metadata.get("default_branch") or "main"
+    tree_url = (
+        f"https://api.github.com/repos/{full_name}/git/trees/"
+        f"{quote(branch, safe='')}?recursive=1"
+    )
+    payload = await _fetch_json(session, tree_url)
+    if not isinstance(payload, dict) or not isinstance(payload.get("tree"), list):
+        return [], [f"{full_name} — не удалось прочитать GitHub tree"]
+
+    ranked = []
+    for item in payload["tree"]:
+        if not isinstance(item, dict) or item.get("type") != "blob":
+            continue
+        path = item.get("path", "")
+        size = item.get("size")
+        if not path or not isinstance(size, int) or not 0 < size <= DISCOVERY_MAX_FILE_BYTES:
+            continue
+        score = _repository_file_score(full_name, path)
+        if score < 1:
+            continue
+        raw_url = (
+            f"https://raw.githubusercontent.com/{full_name}/"
+            f"{quote(branch, safe='')}/{quote(path, safe='/%')}"
+        )
+        try:
+            ranked.append((score, normalize_github_raw_url(raw_url)))
+        except ValueError:
+            continue
+    urls = [url for _, url in sorted(ranked, key=lambda item: (-item[0], item[1]))[:limit]]
+    errors = [] if urls else [f"{full_name} — подходящие текстовые файлы не найдены"]
+    return urls, errors
+
+
+async def _inspect_github_feed_urls(
+    session: aiohttp.ClientSession,
+    urls: Iterable[str],
+    *,
+    min_valid: int,
+    max_results: int,
+) -> List[Dict]:
+    normalized_urls = []
+    for url in urls:
+        try:
+            normalized = normalize_github_raw_url(url)
+        except ValueError:
+            continue
+        if normalized not in normalized_urls:
+            normalized_urls.append(normalized)
+
+    async def inspect(url: str):
+        text = await fetch_text(session, url)
+        if not text:
+            return None
+        extracted = extract_configs(text, proto_filter="vless")[:DISCOVERY_MAX_CONFIGS]
+        valid = deduplicate_configs(await validate_configs(extracted, mode="syntax"))
+        if len(valid) < min_valid:
+            return None
+        parts = [unquote(part) for part in urlsplit(url).path.split("/") if part]
+        return {
+            "url": url,
+            "repository": "/".join(parts[:2]),
+            "filename": parts[-1] if parts else "feed",
+            "extracted_count": len(extracted),
+            "valid_count": len(valid),
+        }
+
+    inspected = await asyncio.gather(*(inspect(url) for url in normalized_urls))
+    return [item for item in inspected if item is not None][:max_results]
+
+
+async def inspect_public_github_urls(
+    urls: Iterable[str],
+    *,
+    min_valid: int = 1,
+    max_results: int = 8,
+) -> List[Dict]:
+    """Download and validate admin-supplied public GitHub feed candidates."""
+    connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        return await _inspect_github_feed_urls(
+            session,
+            urls,
+            min_valid=max(1, min_valid),
+            max_results=max(1, max_results),
+        )
+
+
+async def find_public_github_candidates() -> Tuple[List[Dict], List[str]]:
+    """Run strict bounded discovery for admin approval without adding sources."""
+    source = SOURCES.get("github_discovery")
+    if not source:
+        return [], ["Строгий GitHub-поиск отключён в настройках"]
+    connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        urls, errors = await discover_github_feed_urls(session, source)
+        candidates = await _inspect_github_feed_urls(
+            session,
+            urls,
+            min_valid=DISCOVERY_MIN_VALID,
+            max_results=DISCOVERY_MAX_FEEDS,
+        )
+    if not candidates and not errors:
+        errors.append("Новые подходящие публичные GitHub-источники не найдены")
+    return candidates, errors
+
+
+async def inspect_public_github_repository(
+    repository_url: str,
+    *,
+    max_results: int = 5,
+) -> Tuple[List[Dict], List[str]]:
+    """Find and validate VLESS files in an admin-supplied public repository."""
+    connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        urls, errors = await discover_github_repository_feed_urls(
+            session,
+            repository_url,
+            limit=max(5, max_results * 2),
+        )
+        candidates = await _inspect_github_feed_urls(
+            session,
+            urls,
+            min_valid=1,
+            max_results=max_results,
+        )
+    if not candidates and not errors:
+        errors.append("В репозитории не найдено файлов с валидными VLESS")
+    return candidates, errors
 
 
 async def fetch_discovered_category(

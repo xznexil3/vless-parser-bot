@@ -1,5 +1,7 @@
 import os
 import asyncio
+import hashlib
+import html
 import logging
 import json
 from datetime import datetime, timezone, timedelta
@@ -27,10 +29,23 @@ from ui import button as build_ui_button, icon_text, is_main_menu_text, render_h
 from parser import (
     deduplicate_configs,
     fetch_all,
+    find_public_github_candidates,
+    inspect_public_github_repository,
+    inspect_public_github_urls,
     is_valid_vless,
     parse_vless_info,
     is_valid_any,
     validate_configs,
+)
+from provider_registry import (
+    MAX_DYNAMIC_PROVIDERS,
+    REGISTRY_FILE,
+    build_provider_record,
+    load_provider_registry,
+    normalize_github_raw_url,
+    parse_github_repository_url,
+    registry_content,
+    save_provider_registry,
 )
 from subscription import (
     CHUNK_SIZE,
@@ -58,6 +73,8 @@ AGGREGATED_CACHE = {}
 AGGREGATED_CHUNKS = {}
 AGGREGATED_PROTO_COUNTS = {}
 UPDATE_LOCK = asyncio.Lock()
+PROVIDER_CANDIDATES = {}
+MAX_PROVIDER_CANDIDATES = 100
 USERS_FILE = DATA_DIR / "users.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 DEFAULT_SETTINGS = {
@@ -201,7 +218,11 @@ def admin_keyboard():
                 callback_data="admin_notifications",
                 style=notification_style,
             )],
-            [ui_button("sources", "«Источники»", callback_data="admin_sources", style=KeyboardButtonStyle.PRIMARY)],
+            [
+                ui_button("sources", "«Провайдеры»", callback_data="admin_providers", style=KeyboardButtonStyle.PRIMARY),
+                ui_button("search", "«Поиск источников»", callback_data="admin_discovery", style=KeyboardButtonStyle.SUCCESS),
+            ],
+            [ui_button("info", "«О текущих источниках»", callback_data="admin_sources", style=KeyboardButtonStyle.PRIMARY)],
             [ui_button("back", "«Назад»", callback_data="home", style=KeyboardButtonStyle.PRIMARY)],
         ]
     )
@@ -247,6 +268,121 @@ def support_reply_keyboard(user_id: int) -> InlineKeyboardMarkup:
 def clear_support_state(context):
     context.user_data.pop("support_mode", None)
     context.user_data.pop("support_reply_to", None)
+
+
+def clear_provider_input_state(context):
+    context.user_data.pop("provider_add_mode", None)
+
+
+def dynamic_provider_records() -> list[dict]:
+    return load_provider_registry(REGISTRY_FILE)
+
+
+def providers_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [ui_button("add", "«Добавить по ссылке»", callback_data="provider_add_manual", style=KeyboardButtonStyle.SUCCESS)],
+        [ui_button("search", "«Найти публичные источники»", callback_data="admin_discovery", style=KeyboardButtonStyle.SUCCESS)],
+    ]
+    for record in dynamic_provider_records()[:20]:
+        icon = "enabled" if record.get("enabled", True) else "disabled"
+        category = "⬜" if record.get("category") == "white" else "⬛"
+        label = f"«{category} {record['name'][:32]}»"
+        rows.append([
+            ui_button(
+                icon,
+                label,
+                callback_data=f"provider_view:{record['id']}",
+                style=(
+                    KeyboardButtonStyle.SUCCESS
+                    if record.get("enabled", True)
+                    else KeyboardButtonStyle.DANGER
+                ),
+            )
+        ])
+    rows.append([ui_button("back", "«Назад»", callback_data="admin_panel", style=KeyboardButtonStyle.PRIMARY)])
+    return InlineKeyboardMarkup(rows)
+
+
+def provider_detail_keyboard(record: dict) -> InlineKeyboardMarkup:
+    enabled = bool(record.get("enabled", True))
+    rows = [
+        [ui_button("vless", "«Открыть GitHub-файл»", url=record["urls"][0], style=KeyboardButtonStyle.PRIMARY)],
+        [ui_button(
+            "disabled" if enabled else "enabled",
+            "«Выключить»" if enabled else "«Включить»",
+            callback_data=f"provider_toggle:{record['id']}",
+            style=KeyboardButtonStyle.DANGER if enabled else KeyboardButtonStyle.SUCCESS,
+        )],
+        [ui_button(
+            "delete",
+            "«Удалить»",
+            callback_data=f"provider_delete_confirm:{record['id']}",
+            style=KeyboardButtonStyle.DANGER,
+        )],
+        [ui_button("back", "«Назад»", callback_data="admin_providers", style=KeyboardButtonStyle.PRIMARY)],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def provider_candidate_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            ui_button("white", "«Добавить в белые»", callback_data=f"provider_accept:{token}:white", style=KeyboardButtonStyle.SUCCESS),
+            ui_button("black", "«Добавить в черные»", callback_data=f"provider_accept:{token}:black", style=KeyboardButtonStyle.SUCCESS),
+        ],
+        [ui_button("skip", "«Пропустить»", callback_data=f"provider_skip:{token}", style=KeyboardButtonStyle.DANGER)],
+    ])
+
+
+def remember_provider_candidate(candidate: dict) -> str:
+    token = hashlib.sha256(candidate["url"].encode("utf-8")).hexdigest()[:16]
+    PROVIDER_CANDIDATES[token] = dict(candidate)
+    while len(PROVIDER_CANDIDATES) > MAX_PROVIDER_CANDIDATES:
+        PROVIDER_CANDIDATES.pop(next(iter(PROVIDER_CANDIDATES)))
+    return token
+
+
+def provider_by_id(provider_id: str) -> dict | None:
+    return next(
+        (record for record in dynamic_provider_records() if record.get("id") == provider_id),
+        None,
+    )
+
+
+async def persist_dynamic_providers(records, commit_message: str) -> tuple[bool, str]:
+    """Persist in GitHub when possible and always activate a valid local registry."""
+    published = ""
+    publication_error = ""
+    try:
+        if config.GITHUB_TOKEN and config.GITHUB_REPO:
+            from github_sync import push_text_file
+
+            published = await push_text_file(
+                "providers.json",
+                registry_content(records),
+                config.GITHUB_REPO,
+                config.GITHUB_TOKEN,
+                config.GITHUB_BRANCH,
+                commit_message=commit_message,
+            )
+            if not published:
+                publication_error = "GitHub не принял обновление providers.json"
+        else:
+            publication_error = "GITHUB_TOKEN с Contents read/write не настроен"
+
+        save_provider_registry(records, REGISTRY_FILE)
+        normalized = load_provider_registry(REGISTRY_FILE)
+        previous_dynamic = {key for key in CACHE if key.startswith("dynamic_")}
+        config.apply_dynamic_providers(normalized)
+        for key in previous_dynamic - set(config.SOURCES):
+            CACHE.pop(key, None)
+        if published:
+            return True, published
+        logger.warning("Provider registry is local-only: %s", publication_error)
+        return True, f"local-only: {publication_error}"
+    except Exception as exc:
+        logger.exception("provider registry persistence failed")
+        return False, str(exc)[:300]
 
 
 def chunks_keyboard(
@@ -617,6 +753,7 @@ async def send_initial_banner(update: Update, banner_name: str, text: str, reply
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_support_state(context)
+    clear_provider_input_state(context)
     uid = update.effective_user.id if update.effective_user else None
     user = update.effective_user
     get_or_create_user(uid, user.username if user else "", user.first_name if user else "")
@@ -639,6 +776,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clear_support_state(context)
+    clear_provider_input_state(context)
     uid = update.effective_user.id if update.effective_user else None
     if not await is_user_subscribed(uid, context.bot):
         await update.message.reply_text(f"📢 Подпишись на {config.CHANNEL_USERNAME}, чтобы продолжить", reply_markup=sub_required_keyboard())
@@ -667,6 +805,7 @@ def extract_custom_emoji_ids(message) -> list[str]:
 async def handle_main_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_main_menu_text(update.message.text):
         clear_support_state(context)
+        clear_provider_input_state(context)
         uid = update.effective_user.id if update.effective_user else None
         if not await is_user_subscribed(uid, context.bot):
             await update.message.reply_text(f"📢 Подпишись на {config.CHANNEL_USERNAME}", reply_markup=sub_required_keyboard())
@@ -816,6 +955,106 @@ async def handle_admin_clean(query):
         ),
     )
 
+def provider_panel_text() -> str:
+    records = dynamic_provider_records()
+    enabled = sum(1 for record in records if record.get("enabled", True))
+    return (
+        "<b>🗂️ Динамические провайдеры</b>\n\n"
+        "Можно добавить прямой GitHub-файл или публичный GitHub-репозиторий. "
+        "Бот принимает только текстовые feed-ы с валидными VLESS.\n\n"
+        f"Добавлено: <b>{len(records)}</b> • включено: <b>{enabled}</b>\n\n"
+        "Найденные источники не подключаются автоматически: сначала выбери категорию."
+    )
+
+
+async def send_provider_candidates(message, candidates: list[dict], errors=None) -> int:
+    configured_urls = {
+        url
+        for source in config.SOURCES.values()
+        for url in source.get("urls", [])
+    }
+    configured_urls.update(
+        url
+        for record in dynamic_provider_records()
+        for url in record.get("urls", [])
+    )
+    sent = 0
+    for candidate in candidates:
+        url = candidate.get("url", "")
+        if not url or url in configured_urls:
+            continue
+        token = remember_provider_candidate(candidate)
+        repository = html.escape(str(candidate.get("repository") or "GitHub"))
+        filename = html.escape(str(candidate.get("filename") or "feed"))
+        safe_url = html.escape(url, quote=True)
+        await message.reply_text(
+            render_html(
+                "<b>🔎 Найден публичный VLESS-источник</b>\n\n"
+                f"Репозиторий: <b>{repository}</b>\n"
+                f"Файл: <code>{filename}</code>\n"
+                f"Валидных VLESS: <b>{int(candidate.get('valid_count', 0))}</b>\n\n"
+                f'<a href="{safe_url}">Открыть публичный GitHub-файл</a>',
+                config.CUSTOM_EMOJI_IDS,
+            ),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=provider_candidate_keyboard(token),
+        )
+        sent += 1
+
+    if not sent:
+        error_text = "; ".join(str(error) for error in (errors or []) if error)
+        suffix = f"\n\n<code>{html.escape(error_text[:800])}</code>" if error_text else ""
+        await message.reply_text(
+            f"Новых подходящих публичных GitHub-источников не найдено.{suffix}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_keyboard("admin_providers"),
+        )
+    return sent
+
+
+async def handle_manual_provider_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not context.user_data.get("provider_add_mode"):
+        return False
+    uid = update.effective_user.id if update.effective_user else 0
+    if not config.is_admin(uid):
+        clear_provider_input_state(context)
+        return False
+
+    text = (update.effective_message.text or "").strip()
+    if not text:
+        await update.effective_message.reply_text(
+            "Пришли текстовую HTTPS-ссылку на GitHub-файл или репозиторий.",
+            reply_markup=back_keyboard("admin_providers"),
+        )
+        return True
+
+    await update.effective_message.reply_text("🔎 Проверяю публичный GitHub-источник…")
+    repository = parse_github_repository_url(text)
+    if repository:
+        candidates, errors = await inspect_public_github_repository(text, max_results=5)
+    else:
+        try:
+            normalized = normalize_github_raw_url(text)
+        except ValueError as exc:
+            await update.effective_message.reply_text(
+                f"❌ {html.escape(str(exc))}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=back_keyboard("admin_providers"),
+            )
+            return True
+        candidates = await inspect_public_github_urls(
+            [normalized],
+            min_valid=1,
+            max_results=1,
+        )
+        errors = [] if candidates else ["Файл не содержит валидных VLESS"]
+
+    clear_provider_input_state(context)
+    await send_provider_candidates(update.effective_message, candidates, errors)
+    return True
+
+
 # ---------- Callback ----------
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -846,6 +1085,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "support":
+        clear_provider_input_state(context)
         context.user_data["support_mode"] = True
         context.user_data.pop("support_reply_to", None)
         text = (
@@ -859,10 +1099,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "support_close":
         clear_support_state(context)
+        clear_provider_input_state(context)
         await edit_message_with_banner(query, "main", config.WELCOME_TEXT, main_keyboard(uid))
         return
 
     if data.startswith("support_reply:"):
+        clear_provider_input_state(context)
         if not config.is_admin(uid):
             await query.answer("Только для админа", show_alert=True)
             return
@@ -888,7 +1130,233 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Any regular navigation action closes an unfinished support input mode.
     clear_support_state(context)
 
+    if data in {"admin_providers", "provider_add_manual", "admin_discovery"} or data.startswith("provider_"):
+        if not config.is_admin(uid):
+            await query.answer("Только для админа", show_alert=True)
+            return
+
+        if data == "admin_providers":
+            clear_provider_input_state(context)
+            await edit_message_with_banner(
+                query,
+                "main",
+                provider_panel_text(),
+                providers_keyboard(),
+            )
+            return
+
+        if data == "provider_add_manual":
+            context.user_data["provider_add_mode"] = True
+            await edit_message_with_banner(
+                query,
+                "main",
+                "<b>➕ Добавление провайдера</b>\n\n"
+                "Пришли одним сообщением:\n"
+                "• прямую ссылку на публичный GitHub-файл; или\n"
+                "• ссылку на публичный GitHub-репозиторий.\n\n"
+                "Для репозитория бот сам проверит ограниченное число наиболее подходящих файлов.",
+                back_keyboard("admin_providers"),
+            )
+            return
+
+        if data == "admin_discovery":
+            clear_provider_input_state(context)
+            await edit_message_with_banner(
+                query,
+                "main",
+                "<b>🔎 Поиск публичных источников</b>\n\n"
+                "Ищу на GitHub по строгим фильтрам VLESS + VPN/config/subscription/list/blacklist. "
+                "Ничего не будет добавлено без подтверждения.",
+                back_keyboard("admin_providers"),
+            )
+            candidates, errors = await find_public_github_candidates()
+            sent = await send_provider_candidates(query.message, candidates, errors)
+            if sent:
+                await query.message.reply_text(
+                    f"Найдено кандидатов: <b>{sent}</b>. Выбери категорию под каждым источником.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=back_keyboard("admin_providers"),
+                )
+            return
+
+        if data.startswith("provider_skip:"):
+            token = data.split(":", 1)[1]
+            PROVIDER_CANDIDATES.pop(token, None)
+            await query.edit_message_reply_markup(reply_markup=back_keyboard("admin_providers"))
+            await query.message.reply_text("Источник пропущен.")
+            return
+
+        if data.startswith("provider_accept:"):
+            try:
+                _, token, category = data.split(":", 2)
+            except ValueError:
+                await query.message.reply_text("Некорректная команда добавления.")
+                return
+            candidate = PROVIDER_CANDIDATES.get(token)
+            if not candidate or category not in {"white", "black"}:
+                await query.message.reply_text(
+                    "Кандидат устарел. Запусти поиск или добавление по ссылке заново.",
+                    reply_markup=back_keyboard("admin_providers"),
+                )
+                return
+            verified = await inspect_public_github_urls(
+                [candidate["url"]],
+                min_valid=1,
+                max_results=1,
+            )
+            if not verified:
+                await query.message.reply_text(
+                    "Источник больше не содержит валидных VLESS и не был добавлен.",
+                    reply_markup=back_keyboard("admin_providers"),
+                )
+                return
+            record = build_provider_record(
+                candidate["url"],
+                category,
+                added_at=datetime.now(MSK).isoformat(),
+            )
+            records = dynamic_provider_records()
+            if any(existing["id"] == record["id"] for existing in records):
+                await query.message.reply_text(
+                    "Этот GitHub-файл уже добавлен в провайдеры.",
+                    reply_markup=back_keyboard("admin_providers"),
+                )
+                return
+            if len(records) >= MAX_DYNAMIC_PROVIDERS:
+                await query.message.reply_text(
+                    f"Достигнут лимит динамических провайдеров: {MAX_DYNAMIC_PROVIDERS}. "
+                    "Удали ненужный источник перед добавлением нового.",
+                    reply_markup=back_keyboard("admin_providers"),
+                )
+                return
+            records.append(record)
+            ok, detail = await persist_dynamic_providers(
+                records,
+                f"Add VLESS provider {record['name']}",
+            )
+            if not ok:
+                await query.message.reply_text(
+                    f"❌ Не удалось сохранить провайдера.\n<code>{html.escape(detail)}</code>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=back_keyboard("admin_providers"),
+                )
+                return
+            PROVIDER_CANDIDATES.pop(token, None)
+            await query.edit_message_reply_markup(reply_markup=back_keyboard("admin_providers"))
+            storage_note = (
+                "сохранён в GitHub"
+                if detail.startswith("https://")
+                else "добавлен локально; для сохранения после redeploy настрой GITHUB_TOKEN"
+            )
+            await query.message.reply_text(
+                f"✅ Провайдер <b>{html.escape(record['name'])}</b> {storage_note}. "
+                "Обновляю списки…",
+                parse_mode=ParseMode.HTML,
+            )
+            await update_cache(bot=context.bot)
+            await query.message.reply_text(
+                "✅ Провайдер включён в парсер и списки пересобраны.",
+                reply_markup=providers_keyboard(),
+            )
+            return
+
+        provider_id = data.split(":", 1)[1] if ":" in data else ""
+        record = provider_by_id(provider_id)
+        if not record:
+            await query.message.reply_text(
+                "Провайдер не найден. Возможно, список уже изменился.",
+                reply_markup=providers_keyboard(),
+            )
+            return
+
+        if data.startswith("provider_view:"):
+            category_label = "Белые списки" if record["category"] == "white" else "Черные списки"
+            status = "включён" if record.get("enabled", True) else "выключен"
+            await edit_message_with_banner(
+                query,
+                "main",
+                f"<b>🗂️ {html.escape(record['name'])}</b>\n\n"
+                f"Категория: <b>{category_label}</b>\n"
+                f"Статус: <b>{status}</b>\n"
+                f"Добавлен: <code>{html.escape(record.get('added_at') or '—')}</code>",
+                provider_detail_keyboard(record),
+            )
+            return
+
+        if data.startswith("provider_toggle:"):
+            records = dynamic_provider_records()
+            for item in records:
+                if item["id"] == provider_id:
+                    item["enabled"] = not item.get("enabled", True)
+                    record = item
+                    break
+            ok, detail = await persist_dynamic_providers(
+                records,
+                f"{'Enable' if record['enabled'] else 'Disable'} VLESS provider {record['name']}",
+            )
+            if not ok:
+                await query.message.reply_text(
+                    f"❌ Не удалось изменить провайдера.\n<code>{html.escape(detail)}</code>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=back_keyboard("admin_providers"),
+                )
+                return
+            persistence_note = (
+                ""
+                if detail.startswith("https://")
+                else " Сохранение пока локальное: настрой GITHUB_TOKEN для переживания redeploy."
+            )
+            await query.message.reply_text(
+                f"Изменение сохранено. Пересобираю списки…{persistence_note}"
+            )
+            await update_cache(bot=context.bot)
+            await edit_message_with_banner(query, "main", provider_panel_text(), providers_keyboard())
+            return
+
+        if data.startswith("provider_delete_confirm:"):
+            await edit_message_with_banner(
+                query,
+                "main",
+                f"<b>Удалить провайдера?</b>\n\n{html.escape(record['name'])}\n\n"
+                "После подтверждения источник будет удалён из providers.json и списки пересоберутся.",
+                InlineKeyboardMarkup([
+                    [ui_button("delete", "«Да, удалить»", callback_data=f"provider_delete:{provider_id}", style=KeyboardButtonStyle.DANGER)],
+                    [ui_button("back", "«Отмена»", callback_data=f"provider_view:{provider_id}", style=KeyboardButtonStyle.PRIMARY)],
+                ]),
+            )
+            return
+
+        if data.startswith("provider_delete:"):
+            records = [
+                item for item in dynamic_provider_records() if item["id"] != provider_id
+            ]
+            ok, detail = await persist_dynamic_providers(
+                records,
+                f"Remove VLESS provider {record['name']}",
+            )
+            if not ok:
+                await query.message.reply_text(
+                    f"❌ Не удалось удалить провайдера.\n<code>{html.escape(detail)}</code>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=back_keyboard("admin_providers"),
+                )
+                return
+            persistence_note = (
+                ""
+                if detail.startswith("https://")
+                else " Удаление пока локальное: настрой GITHUB_TOKEN для переживания redeploy."
+            )
+            await query.message.reply_text(
+                f"Провайдер удалён. Пересобираю списки…{persistence_note}"
+            )
+            await update_cache(bot=context.bot)
+            await edit_message_with_banner(query, "main", provider_panel_text(), providers_keyboard())
+            return
+
+    clear_provider_input_state(context)
+
     if data == "home":
+        clear_provider_input_state(context)
         await edit_message_with_banner(query, "main", config.WELCOME_TEXT, main_keyboard(uid))
         return
 
@@ -929,6 +1397,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not config.is_admin(uid):
             await query.answer("Только для админа", show_alert=True)
             return
+        clear_provider_input_state(context)
         await edit_message_with_banner(query, "main", "<b>⚙️ Админ панель</b>\n\nВыбери действие:", admin_keyboard())
         return
 
@@ -1180,7 +1649,11 @@ async def message_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     text = (update.message.text or "").strip()
     if is_main_menu_text(text):
         clear_support_state(context)
+        clear_provider_input_state(context)
         await send_initial_banner(update, "main", config.WELCOME_TEXT, main_keyboard(uid))
+        return
+
+    if await handle_manual_provider_input(update, context):
         return
 
     if await relay_support_message(update, context):

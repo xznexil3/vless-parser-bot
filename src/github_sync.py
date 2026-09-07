@@ -55,6 +55,79 @@ def _is_managed_path(path: str, groups: set) -> bool:
     return bool(match and (directory, match.group(1)) in groups)
 
 
+async def push_text_file(
+    path: str,
+    content: str,
+    repo: str,
+    token: str,
+    branch: str = "main",
+    commit_message: str = "Update bot provider registry",
+    retries: int = 2,
+) -> str:
+    """Create or replace one UTF-8 repository file without force-pushing."""
+    normalized_path = str(PurePosixPath(path)).lstrip("/")
+    if (
+        not token
+        or not repo
+        or "/" not in repo
+        or not normalized_path
+        or normalized_path.startswith("../")
+    ):
+        return ""
+
+    body = content.encode("utf-8")
+    expected_sha = _git_blob_sha(body)
+    encoded_path = quote(normalized_path, safe="/")
+    headers = _headers(token)
+    timeout = aiohttp.ClientTimeout(total=60, connect=15, sock_read=30)
+    url = f"{API_ROOT}/repos/{repo}/contents/{encoded_path}"
+
+    for attempt in range(retries + 1):
+        try:
+            async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+                current_sha = None
+                async with session.get(url, params={"ref": branch}) as response:
+                    if response.status == 200:
+                        current = await response.json()
+                        current_sha = current.get("sha")
+                        if current_sha == expected_sha:
+                            return (
+                                f"https://raw.githubusercontent.com/{repo}/{branch}/"
+                                f"{quote(normalized_path, safe='/')}"
+                            )
+                    elif response.status != 404:
+                        await _response_json(response, f"read {normalized_path}")
+
+                payload = {
+                    "message": commit_message,
+                    "content": base64.b64encode(body).decode("ascii"),
+                    "branch": branch,
+                }
+                if current_sha:
+                    payload["sha"] = current_sha
+                async with session.put(url, json=payload) as response:
+                    if response.status in {409, 422} and attempt < retries:
+                        await asyncio.sleep(1)
+                        continue
+                    await _response_json(
+                        response,
+                        f"write {normalized_path}",
+                        expected=(200, 201),
+                    )
+                return (
+                    f"https://raw.githubusercontent.com/{repo}/{branch}/"
+                    f"{quote(normalized_path, safe='/')}"
+                )
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError, KeyError) as exc:
+            if attempt < retries:
+                logger.warning("GitHub file update failed, retrying: %s", exc)
+                await asyncio.sleep(1)
+                continue
+            logger.error("GitHub file update failed: %s", exc)
+            return ""
+    return ""
+
+
 async def push_aggregated_subscriptions(
     aggregated_files: dict,
     repo: str,

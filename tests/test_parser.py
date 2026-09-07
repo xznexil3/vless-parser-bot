@@ -19,6 +19,7 @@ import config  # noqa: E402
 import github_sync  # noqa: E402
 import health  # noqa: E402
 import parser  # noqa: E402
+import provider_registry  # noqa: E402
 import subscription  # noqa: E402
 from telegram.constants import KeyboardButtonStyle, ParseMode  # noqa: E402
 
@@ -418,6 +419,57 @@ class GithubSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("BLACK_FULL_1.txt", urls)
         self.assertNotIn("README.md", {entry["path"] for entry in entries})
 
+    async def test_provider_registry_file_is_created_without_force_push(self):
+        class FakeResponse:
+            def __init__(self, payload, status):
+                self.payload = payload
+                self.status = status
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def json(self):
+                return self.payload
+
+            async def text(self):
+                return str(self.payload)
+
+        class FakeSession:
+            def __init__(self):
+                self.put_payload = None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            def get(self, _url, **_kwargs):
+                return FakeResponse({}, 404)
+
+            def put(self, _url, **kwargs):
+                self.put_payload = kwargs["json"]
+                return FakeResponse({"content": {"sha": "new"}}, 201)
+
+        session = FakeSession()
+        with patch.object(github_sync.aiohttp, "ClientSession", return_value=session):
+            url = await github_sync.push_text_file(
+                "providers.json",
+                '{"version": 1}\n',
+                "owner/repo",
+                "secret",
+            )
+        self.assertEqual(
+            url,
+            "https://raw.githubusercontent.com/owner/repo/main/providers.json",
+        )
+        self.assertEqual(session.put_payload["branch"], "main")
+        self.assertNotIn("force", session.put_payload)
+        self.assertNotIn("sha", session.put_payload)
+
 
 class SubscriptionTests(unittest.TestCase):
     def test_stale_chunks_remain_until_new_map_is_ready_then_are_deleted(self):
@@ -599,6 +651,183 @@ class NotificationAndSupportTests(unittest.IsolatedAsyncioTestCase):
         message.reply_text.assert_awaited_once()
 
 
+class DynamicProviderRegistryTests(unittest.TestCase):
+    def test_github_file_links_are_normalized_and_external_urls_rejected(self):
+        expected = (
+            "https://raw.githubusercontent.com/owner/vpn-repo/main/"
+            "vless_configs.txt"
+        )
+        self.assertEqual(
+            provider_registry.normalize_github_raw_url(
+                "https://github.com/owner/vpn-repo/blob/main/vless_configs.txt"
+            ),
+            expected,
+        )
+        self.assertEqual(
+            provider_registry.normalize_github_raw_url(expected),
+            expected,
+        )
+        for unsafe in (
+            "http://github.com/owner/repo/blob/main/vless.txt",
+            "https://example.com/owner/repo/vless.txt",
+            "https://github.com/owner/repo/blob/main/vless.txt?token=secret",
+            "https://user:pass@github.com/owner/repo/blob/main/vless.txt",
+        ):
+            with self.subTest(url=unsafe):
+                with self.assertRaises(ValueError):
+                    provider_registry.normalize_github_raw_url(unsafe)
+
+    def test_exact_public_repository_links_are_supported(self):
+        self.assertEqual(
+            provider_registry.parse_github_repository_url(
+                "https://github.com/owner/vpn-repo"
+            ),
+            ("owner", "vpn-repo"),
+        )
+        self.assertIsNone(
+            provider_registry.parse_github_repository_url(
+                "https://github.com/owner/vpn-repo/issues"
+            )
+        )
+
+    def test_registry_round_trip_and_runtime_category_application(self):
+        url = (
+            "https://raw.githubusercontent.com/owner/vpn-repo/main/"
+            "vless_configs.txt"
+        )
+        record = provider_registry.build_provider_record(
+            url,
+            "black",
+            added_at="2026-09-07T20:00:00+03:00",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "providers.json"
+            provider_registry.save_provider_registry([record], path)
+            self.assertEqual(
+                provider_registry.load_provider_registry(path),
+                [record],
+            )
+
+        original = list(config.DYNAMIC_PROVIDER_RECORDS)
+        try:
+            config.apply_dynamic_providers([record])
+            self.assertIn(record["id"], config.SOURCES)
+            self.assertIn(record["id"], config.BLACK_SOURCE_KEYS)
+            self.assertNotIn(record["id"], config.WHITE_SOURCE_KEYS)
+            self.assertIn(
+                record["id"],
+                config.AGGREGATED_SUBS["BLACK_FULL"]["source_keys"],
+            )
+            self.assertIn(
+                record["id"],
+                config.AGGREGATED_SUBS["FULL"]["source_keys"],
+            )
+            disabled = dict(record, enabled=False)
+            config.apply_dynamic_providers([disabled])
+            self.assertNotIn(record["id"], config.SOURCES)
+            self.assertIn(disabled, config.DYNAMIC_PROVIDER_RECORDS)
+        finally:
+            config.apply_dynamic_providers(original)
+
+    def test_registry_has_a_bounded_provider_count(self):
+        records = [
+            provider_registry.build_provider_record(
+                f"https://raw.githubusercontent.com/owner/vpn-repo/main/vless_{index}.txt",
+                "black",
+                added_at="2026-09-07T20:00:00+03:00",
+            )
+            for index in range(provider_registry.MAX_DYNAMIC_PROVIDERS + 5)
+        ]
+        self.assertEqual(
+            len(provider_registry.normalize_registry(records)),
+            provider_registry.MAX_DYNAMIC_PROVIDERS,
+        )
+
+    def test_provider_candidate_buttons_require_explicit_category_approval(self):
+        keyboard = bot.provider_candidate_keyboard("abcd1234")
+        buttons = {
+            button.callback_data: button
+            for row in keyboard.inline_keyboard
+            for button in row
+        }
+        self.assertEqual(
+            buttons["provider_accept:abcd1234:white"].style,
+            KeyboardButtonStyle.SUCCESS,
+        )
+        self.assertEqual(
+            buttons["provider_accept:abcd1234:black"].style,
+            KeyboardButtonStyle.SUCCESS,
+        )
+        self.assertEqual(
+            buttons["provider_skip:abcd1234"].style,
+            KeyboardButtonStyle.DANGER,
+        )
+
+    def test_repository_candidate_ranking_remains_vless_vpn_bounded(self):
+        self.assertGreater(
+            parser._repository_file_score(
+                "owner/vpn-repo", "feeds/vless_configs.txt"
+            ),
+            0,
+        )
+        self.assertLess(
+            parser._repository_file_score("owner/unrelated", "README.md"),
+            0,
+        )
+        self.assertLess(
+            parser._repository_file_score("owner/unrelated", "image.png"),
+            0,
+        )
+
+
+class DynamicProviderAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_candidate_inspection_accepts_only_valid_vless(self):
+        url = (
+            "https://raw.githubusercontent.com/owner/vpn-repo/main/"
+            "vless_configs.txt"
+        )
+        valid = vless()
+        with patch.object(
+            parser,
+            "fetch_text",
+            AsyncMock(return_value=f"{valid}\ntrojan://ignored@example.com:443"),
+        ):
+            result = await parser._inspect_github_feed_urls(
+                None,
+                [url],
+                min_valid=1,
+                max_results=2,
+            )
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["url"], url)
+        self.assertEqual(result[0]["valid_count"], 1)
+
+    async def test_registry_works_locally_without_github_token_and_warns(self):
+        record = provider_registry.build_provider_record(
+            "https://raw.githubusercontent.com/owner/vpn-repo/main/vless.txt",
+            "white",
+            added_at="2026-09-07T20:00:00+03:00",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            registry_path = Path(directory) / "providers.json"
+            with (
+                patch.object(bot, "REGISTRY_FILE", registry_path),
+                patch.object(config, "GITHUB_TOKEN", ""),
+                patch.object(config, "apply_dynamic_providers") as apply,
+            ):
+                ok, detail = await bot.persist_dynamic_providers(
+                    [record],
+                    "test provider",
+                )
+            self.assertTrue(ok)
+            self.assertTrue(detail.startswith("local-only:"))
+            self.assertEqual(
+                provider_registry.load_provider_registry(registry_path),
+                [record],
+            )
+            apply.assert_called_once_with([record])
+
+
 class SourceRegistryTests(unittest.TestCase):
     def test_only_selected_github_sources_are_registered(self):
         self.assertNotIn("collection", config.SOURCES)
@@ -748,6 +977,14 @@ class SourceRegistryTests(unittest.TestCase):
             KeyboardButtonStyle.SUCCESS,
         )
         self.assertIn("Уведомления: ВКЛ", enabled["admin_notifications"].text)
+        self.assertEqual(
+            enabled["admin_providers"].style,
+            KeyboardButtonStyle.PRIMARY,
+        )
+        self.assertEqual(
+            enabled["admin_discovery"].style,
+            KeyboardButtonStyle.SUCCESS,
+        )
 
         with patch.object(
             bot,
