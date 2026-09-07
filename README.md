@@ -12,7 +12,7 @@ Telegram-бот собирает публичные VLESS-конфигураци
 
 Белые GitHub feed-ы: zieng2, igareck, CID VPN, ByeWhiteLists 2.0 и Ghost VPN. Чёрные GitHub feed-ы: igareck, Ghost VPN и AetrisVPN.
 
-Дополнительный `github_discovery` использует GitHub Repository Search и Git Tree API. Поиск проходит отдельными группами по VLESS, VPN, proxy/Xray, subscription, config, white/whitelist, black/blacklist и list, поэтому слово `vless` не обязано присутствовать в названии самого файла. Из каждого репозитория проверяется до 3 подходящих feed-ов; за обновление — до 12 репозиториев, 16 feed-ов и 3000 уникальных конфигураций. Даже для смешанного VPN-feed-а в результат попадают исключительно синтаксически валидные VLESS.
+Широкий GitHub Repository Search не является автоматическим provider-ом и не участвует в обновлении, подсчёте или «Проверке и очистке». Он запускается только администратором через «Поиск источников», проходит отдельными группами по VLESS, VPN, proxy/Xray, subscription, config, white/whitelist, black/blacklist и list, поэтому слово `vless` не обязано присутствовать в названии файла. За один ручной поиск проверяется до 12 репозиториев, 3 файлов на репозиторий и 16 кандидатов. В агрегаты попадают только отдельно одобренные администратором GitHub-feed-ы и только валидные VLESS.
 
 ### Управление провайдерами из бота
 
@@ -58,7 +58,7 @@ Telegram-бот собирает публичные VLESS-конфигураци
 
 Кнопка администратора **«Проверка и очистка»** заново загружает источники, включает режим `tcp`, удаляет невалидные/недоступные конфигурации и перестраивает агрегаты. При временной ошибке provider-а старый кэш этого provider-а не стирается вслепую: его endpoints повторно проверяются.
 
-TCP-проверка подтверждает доступность endpoint-а, но не может гарантировать срок жизни публичного UUID или успешность VLESS-аутентификации без полноценного подключения клиентом.
+TCP-проверка подтверждает доступность endpoint-а, но не может гарантировать срок жизни публичного UUID или успешность VLESS-аутентификации без полноценного подключения клиентом. В карточке отдельного конфига кнопка «Проверить соединение» измеряет TCP connect latency (включая DNS) и дважды редактирует то же сообщение: сначала показывает процесс проверки, затем результат в миллисекундах или ошибку.
 
 ## ✨ Возможности
 
@@ -74,7 +74,10 @@ TCP-проверка подтверждает доступность endpoint-а
 - обработка старых кнопок вроде `BLACK_FULL_6.txt` с переходом к актуальным пакетам;
 - встроенная поддержка: пользователь пишет в бот, администратор отвечает через защищённый relay без публикации личного username;
 - включение и выключение уведомлений в админ-панели;
-- замена предыдущего уведомления о списках новым сообщением после каждого обновления;
+- замена предыдущего уведомления о списках новым сообщением после каждого обновления с изменением количества: `(+N)`, `(-N)` или `(0)`;
+- пагинированный список отдельных VLESS-конфигов без показа сырого URI;
+- карточка host/port/transport/security/SNI и проверка TCP-соединения с задержкой прямо в редактируемом сообщении;
+- текущее уникальное количество VLESS в админ-панели, статистике и отчёте очистки;
 - поиск публичных GitHub VLESS-feed-ов с ручным подтверждением администратора;
 - добавление GitHub-файлов и репозиториев, включение, выключение и удаление динамических провайдеров;
 - ручная строгая проверка одного вставленного VLESS URI;
@@ -133,12 +136,11 @@ docker logs -f vless-parser-bot
 | `REQUIRED_CHANNEL` | Канал для проверки подписки пользователя | `@vpncrimson` |
 | `CHECK_MODE` | `none`, `syntax` или `tcp` | `syntax` |
 | `UPDATE_INTERVAL` | Интервал автообновления, минут | `60` |
-| `AUTO_DISCOVERY` | Автопоиск новых публичных GitHub VLESS feed-ов | `true` |
-| `DISCOVERY_MAX_REPOS` | Максимум GitHub-репозиториев за один поиск | `12` |
-| `DISCOVERY_MAX_FEEDS` | Максимум найденных файлов за обновление | `16` |
-| `DISCOVERY_MAX_FILES_PER_REPO` | Максимум feed-файлов из одного репозитория | `3` |
-| `DISCOVERY_MIN_VALID` | Минимум валидных VLESS для принятия feed-а | `1` |
-| `DISCOVERY_MAX_CONFIGS` | Максимум конфигураций из автопоиска | `3000` |
+| `DISCOVERY_MAX_REPOS` | Максимум GitHub-репозиториев за один ручной поиск | `12` |
+| `DISCOVERY_MAX_FEEDS` | Максимум кандидатов за один ручной поиск | `16` |
+| `DISCOVERY_MAX_FILES_PER_REPO` | Максимум проверяемых файлов из одного репозитория | `3` |
+| `DISCOVERY_MIN_VALID` | Минимум валидных VLESS для показа кандидата | `1` |
+| `DISCOVERY_MAX_CONFIGS` | Максимум проверяемых конфигураций одного кандидата | `3000` |
 | `GITHUB_TOKEN` | Fine-grained токен с Contents read/write для агрегатов и `providers.json` | — |
 | `GITHUB_REPO` | Репозиторий агрегатов | `xznexil3/vless-parser-bot` |
 | `GITHUB_BRANCH` | Ветка публикации `.txt`-файлов | `main` |
@@ -147,7 +149,7 @@ docker logs -f vless-parser-bot
 ## 🧠 Pipeline
 
 ```text
-selected GitHub feeds + approved providers.json + expanded bounded GitHub discovery
+selected GitHub feeds + individually approved providers.json
   → bounded fetch
   → plain / escaped / base64 extraction
   → strict VLESS validation
@@ -165,7 +167,7 @@ python -m unittest discover -s tests -v
 python -m py_compile src/*.py tests/*.py
 ```
 
-Тесты покрывают plain/base64/escaped extraction входных данных, VLESS/Reality validation, private host rejection, normalized deduplication, строгие GitHub-фильтры, лимиты discovery, нормализацию GitHub provider-ссылок, реестр динамических провайдеров, endpoint check deduplication, файловый интерфейс, цветовые стили кнопок и очистку устаревших chunks.
+Тесты покрывают plain/base64/escaped extraction входных данных, VLESS/Reality validation, private host rejection, normalized deduplication, GitHub-фильтры и лимиты discovery, динамических провайдеров, пагинацию конфигов, TCP latency, редактирование результата проверки, разницу в уведомлениях, файловый интерфейс, цветовые стили кнопок и очистку устаревших chunks.
 
 ## 📂 Структура
 

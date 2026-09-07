@@ -26,12 +26,6 @@ CHANNEL_LINK = "https://t.me/vpncrimson"
 CHECK_MODE = os.getenv("CHECK_MODE", "syntax").strip().lower()
 UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", "60"))
 PORT = int(os.getenv("PORT", "8080"))
-AUTO_DISCOVERY = os.getenv("AUTO_DISCOVERY", "true").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
 DISCOVERY_MAX_REPOS = max(1, min(int(os.getenv("DISCOVERY_MAX_REPOS", "12")), 24))
 DISCOVERY_MAX_FEEDS = max(1, min(int(os.getenv("DISCOVERY_MAX_FEEDS", "16")), 16))
 DISCOVERY_MAX_FILES_PER_REPO = max(
@@ -75,7 +69,7 @@ def pe(name: str, fallback: str = "") -> str:
     return ""
 
 
-# Only explicitly selected GitHub feeds and strict GitHub discovery are used.
+# Only explicitly selected GitHub feeds are automatic aggregation sources.
 # Non-GitHub mirrors and broad collection/index feeds are intentionally excluded.
 SOURCES = {
     "zieng2": {
@@ -145,25 +139,23 @@ SOURCES = {
             "https://raw.githubusercontent.com/flaafix/AetrisVPN-black-list/main/configs.txt",
         ],
     },
-    "github_discovery": {
-        "name": "Расширенный GitHub-поиск VPN/VLESS",
-        "description": "Широкий ограниченный поиск публичных VPN/VLESS feed-ов на GitHub",
-        "discovery": True,
-        "search_queries": [
-            "vless vpn config in:name,description,readme",
-            "vless subscription in:name,description,readme",
-            "vless config list in:name,description,readme",
-            "vpn subscription config in:name,description,readme",
-            "vpn whitelist config in:name,description,readme",
-            "vpn blacklist config in:name,description,readme",
-            "vless white list in:name,description,readme",
-            "vless black list in:name,description,readme",
-        ],
-        "urls": [],
-    },
 }
-if not AUTO_DISCOVERY:
-    SOURCES.pop("github_discovery", None)
+
+# This definition is used only when an administrator explicitly presses
+# «Поиск источников». Search results never enter aggregation until individually
+# approved and persisted as dynamic providers.
+PUBLIC_GITHUB_SEARCH = {
+    "search_queries": [
+        "vless vpn config in:name,description,readme",
+        "vless subscription in:name,description,readme",
+        "vless config list in:name,description,readme",
+        "vpn subscription config in:name,description,readme",
+        "vpn whitelist config in:name,description,readme",
+        "vpn blacklist config in:name,description,readme",
+        "vless white list in:name,description,readme",
+        "vless black list in:name,description,readme",
+    ],
+}
 
 STATIC_WHITE_SOURCE_KEYS = (
     "zieng2",
@@ -176,7 +168,6 @@ STATIC_BLACK_SOURCE_KEYS = (
     "igareck_black",
     "ghost_vpn_black",
     "aetris_vpn",
-    *(("github_discovery",) if AUTO_DISCOVERY else ()),
 )
 STATIC_SOURCE_KEYS = frozenset(SOURCES)
 WHITE_SOURCE_KEYS = list(STATIC_WHITE_SOURCE_KEYS)
@@ -275,6 +266,7 @@ HELP_TEXT = f"""<b>❔ Free VPN • Crimson — помощь</b>
 <b>⬜ «Белые списки»</b> — для ТСПУ
 <b>⬛ «Черные списки»</b> — весь трафик через VPN
 <b>📚 «Полный список»</b> — все вместе
+<b>🧾 Список конфигов</b> — параметры каждого VLESS и проверка TCP-задержки прямо в сообщении
 <b>💬 «Поддержка»</b> — написать команде бота, не переходя в личные сообщения
 
 📄 Бот отправляет только готовые <code>.txt</code>-файлы, без ссылок на подписки.
@@ -287,6 +279,6 @@ HELP_TEXT = f"""<b>❔ Free VPN • Crimson — помощь</b>
 
 SOURCES_TEXT = """<b>🗂️ Источники VLESS</b>
 
-Используются только GitHub feed-ы: zieng2, igareck, CID VPN, ByeWhiteLists 2.0, Ghost VPN, AetrisVPN, одобренные администратором провайдеры и строгий GitHub-поиск.
+Автоматически используются только отобранные GitHub feed-ы: zieng2, igareck, CID VPN, ByeWhiteLists 2.0, Ghost VPN, AetrisVPN и одобренные администратором провайдеры.
 
-🔎 Поиск охватывает VLESS, VPN, proxy/Xray, config, subscription, white/whitelist, black/blacklist и list. Широкие collection/index-источники не подключаются напрямую: бот проверяет найденные GitHub-файлы. Из содержимого принимаются только корректные <b>VLESS</b>; дубликаты удаляются."""
+🔎 Ручной админ-поиск охватывает VLESS, VPN, proxy/Xray, config, subscription, white/whitelist, black/blacklist и list. Найденные файлы не участвуют в обновлении или очистке, пока администратор явно не одобрит каждый источник. Из содержимого принимаются только корректные <b>VLESS</b>; дубликаты удаляются."""

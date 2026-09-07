@@ -13,7 +13,6 @@ from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 import aiohttp
 
 from config import (
-    AUTO_DISCOVERY,
     DISCOVERY_MAX_CONFIGS,
     DISCOVERY_MAX_FEEDS,
     DISCOVERY_MAX_FILES_PER_REPO,
@@ -21,6 +20,7 @@ from config import (
     DISCOVERY_MIN_VALID,
     GITHUB_REPO,
     GITHUB_TOKEN,
+    PUBLIC_GITHUB_SEARCH,
     SOURCES,
 )
 from provider_registry import (
@@ -53,7 +53,6 @@ MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_DECODE_DEPTH = 3
 MAX_DECODED_ITEMS = 10_000
 DISCOVERY_MAX_FILE_BYTES = 8 * 1024 * 1024
-DISCOVERY_MAX_CONFIGS_PER_FEED = 300
 DISCOVERY_ALLOWED_SUFFIXES = {"", ".txt", ".conf", ".list", ".json", ".yaml", ".yml"}
 DISCOVERY_EXCLUDED_NAMES = {
     "readme",
@@ -563,9 +562,6 @@ async def discover_github_feed_urls(
     Repository and file paths must match VPN/proxy plus config/subscription/
     white/black/list filters. Every payload then passes the VLESS validator.
     """
-    if not AUTO_DISCOVERY:
-        return [], ["автопоиск отключён"]
-
     errors = []
     candidates = []
     repository_buckets = []
@@ -824,12 +820,9 @@ async def inspect_public_github_urls(
 
 async def find_public_github_candidates() -> Tuple[List[Dict], List[str]]:
     """Run strict bounded discovery for admin approval without adding sources."""
-    source = SOURCES.get("github_discovery")
-    if not source:
-        return [], ["Расширенный GitHub-поиск отключён в настройках"]
     connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
     async with aiohttp.ClientSession(connector=connector) as session:
-        urls, errors = await discover_github_feed_urls(session, source)
+        urls, errors = await discover_github_feed_urls(session, PUBLIC_GITHUB_SEARCH)
         candidates = await _inspect_github_feed_urls(
             session,
             urls,
@@ -865,56 +858,6 @@ async def inspect_public_github_repository(
     return candidates, errors
 
 
-async def fetch_discovered_category(
-    session: aiohttp.ClientSession,
-    category_key: str,
-    source: Dict,
-    mode: str,
-) -> Dict:
-    candidate_urls, errors = await discover_github_feed_urls(session, source)
-
-    async def inspect(url: str):
-        text = await fetch_text(session, url)
-        if not text:
-            return url, [], 0
-        extracted = extract_configs(text, proto_filter="vless")
-        filtered = await validate_configs(extracted, mode=mode)
-        return url, filtered[:DISCOVERY_MAX_CONFIGS_PER_FEED], len(extracted)
-
-    inspected = await asyncio.gather(*(inspect(url) for url in candidate_urls))
-    configs = []
-    used_urls = []
-    raw_total = 0
-    for url, valid, extracted_count in inspected:
-        if len(valid) < DISCOVERY_MIN_VALID:
-            continue
-        used_urls.append(url)
-        raw_total += extracted_count
-        configs = deduplicate_configs(
-            [*configs, *valid[:DISCOVERY_MAX_CONFIGS_PER_FEED]]
-        )[:DISCOVERY_MAX_CONFIGS]
-        if len(configs) >= DISCOVERY_MAX_CONFIGS:
-            break
-    if not configs:
-        errors.append("автопоиск не нашёл подходящих VLESS-подписок")
-    return {
-        "key": category_key,
-        "name": source["name"],
-        "description": source.get("description", ""),
-        "configs": configs,
-        "raw_total": raw_total,
-        "filtered_total": len(configs),
-        "removed": max(0, raw_total - len(configs)),
-        "validation_mode": mode,
-        "invalid_reasons": {},
-        "errors": errors,
-        "urls": [],
-        "used_urls": used_urls,
-        "discovered_urls": candidate_urls,
-        "raw_text": "\n".join(f"# Discovered: {url}" for url in used_urls),
-    }
-
-
 def extract_host_port(link: str) -> Optional[Tuple[str, int]]:
     ok, _ = is_valid_vless(link)
     if not ok:
@@ -926,18 +869,35 @@ def extract_host_port(link: str) -> Optional[Tuple[str, int]]:
         return None
 
 
-async def check_tcp(host: str, port: int, timeout: float = 3.0) -> bool:
-    """Check whether the VLESS endpoint accepts a TCP connection."""
+async def measure_tcp_latency(
+    host: str,
+    port: int,
+    timeout: float = 3.0,
+) -> Optional[int]:
+    """Measure TCP connect latency in milliseconds, including DNS lookup."""
+    if not host or not isinstance(port, int) or not 1 <= port <= 65535:
+        return None
+    loop = asyncio.get_running_loop()
+    started = loop.time()
     try:
-        _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port),
+            timeout=timeout,
+        )
+        latency_ms = max(1, round((loop.time() - started) * 1000))
         writer.close()
         try:
             await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
         except (ConnectionError, asyncio.TimeoutError):
             pass
-        return True
+        return latency_ms
     except (OSError, asyncio.TimeoutError, ValueError):
-        return False
+        return None
+
+
+async def check_tcp(host: str, port: int, timeout: float = 3.0) -> bool:
+    """Check whether the VLESS endpoint accepts a TCP connection."""
+    return await measure_tcp_latency(host, port, timeout=timeout) is not None
 
 
 def is_valid_any(link: str) -> Tuple[bool, str]:
@@ -1048,9 +1008,6 @@ async def fetch_category(
             "error": "unknown category",
             "errors": ["unknown category"],
         }
-    if cfg.get("discovery"):
-        return await fetch_discovered_category(session, category_key, cfg, mode)
-
     strategy = cfg.get("url_strategy", "all")
     if strategy not in {"all", "first_available"}:
         strategy = "all"

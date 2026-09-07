@@ -4,6 +4,7 @@ import hashlib
 import html
 import logging
 import json
+import re
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from parser import (
     inspect_public_github_repository,
     inspect_public_github_urls,
     is_valid_vless,
+    measure_tcp_latency,
     parse_vless_info,
     is_valid_any,
     validate_configs,
@@ -75,6 +77,7 @@ AGGREGATED_PROTO_COUNTS = {}
 UPDATE_LOCK = asyncio.Lock()
 PROVIDER_CANDIDATES = {}
 MAX_PROVIDER_CANDIDATES = 100
+CONFIGS_PER_PAGE = 8
 USERS_FILE = DATA_DIR / "users.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 DEFAULT_SETTINGS = {
@@ -462,6 +465,253 @@ def protocol_keyboard(agg_key: str):
         ]
     )
 
+
+def aggregate_back_target(agg_key: str) -> str:
+    candidate = agg_key.lower().replace("_full", "")
+    return candidate if candidate in {"white", "black", "full"} else "home"
+
+
+def aggregate_configs(agg_key: str) -> list[str]:
+    aggregate = config.AGGREGATED_SUBS.get(agg_key)
+    if not aggregate:
+        return []
+    return list(AGGREGATED_CACHE.get(aggregate["filename"], {}).get("configs", []))
+
+
+def current_vless_count() -> int:
+    """Return the current unique FULL count, including bootstrap before preload."""
+    full = config.AGGREGATED_SUBS.get("FULL", {})
+    filename = full.get("filename", "FULL.txt")
+    cached = AGGREGATED_CACHE.get(filename, {}).get("count")
+    if isinstance(cached, int):
+        return cached
+    if CACHE:
+        links = [
+            link
+            for source_key in full.get("source_keys", [])
+            for link in CACHE.get(source_key, {}).get("configs", [])
+        ]
+        if links:
+            return len(deduplicate_configs(links))
+    bootstrap = DATA_DIR.parent / filename
+    try:
+        match = re.search(
+            r"^# Количество:\s*(\d+)\s*$",
+            bootstrap.read_text(encoding="utf-8"),
+            flags=re.MULTILINE,
+        )
+        if match:
+            return int(match.group(1))
+    except OSError:
+        pass
+    return 0
+
+
+def admin_panel_text() -> str:
+    return (
+        "<b>⚙️ Админ панель</b>\n\n"
+        f"Текущее количество VLESS-конфигов: <b>{current_vless_count()}</b>\n\n"
+        "Выбери действие:"
+    )
+
+
+def config_token(link: str) -> str:
+    return hashlib.sha256(link.encode("utf-8")).hexdigest()[:12]
+
+
+def config_by_token(agg_key: str, token: str):
+    for index, link in enumerate(aggregate_configs(agg_key)):
+        if config_token(link) == token:
+            return index, link
+    return None, None
+
+
+def _config_page(agg_key: str, requested_page: int) -> tuple[list[str], int, int]:
+    configs = aggregate_configs(agg_key)
+    page_count = max(1, (len(configs) + CONFIGS_PER_PAGE - 1) // CONFIGS_PER_PAGE)
+    page = max(0, min(requested_page, page_count - 1))
+    return configs, page, page_count
+
+
+def config_list_keyboard(agg_key: str, requested_page: int = 0) -> InlineKeyboardMarkup:
+    configs, page, page_count = _config_page(agg_key, requested_page)
+    start = page * CONFIGS_PER_PAGE
+    rows = []
+    for index, link in enumerate(configs[start:start + CONFIGS_PER_PAGE], start=start):
+        info = parse_vless_info(link)
+        raw_name = str(info.get("remark") or info.get("host") or "VLESS")
+        if info.get("error") or raw_name.lower().startswith("vless://"):
+            raw_name = "VLESS-конфиг"
+        name = " ".join(raw_name.split())
+        name = name[:42] + ("…" if len(name) > 42 else "")
+        rows.append([
+            ui_button(
+                "vless",
+                f"«{index + 1}. {name}»",
+                callback_data=f"cfgdetail:{agg_key}:{config_token(link)}:{page}",
+                style=KeyboardButtonStyle.SUCCESS,
+            )
+        ])
+    navigation = []
+    if page > 0:
+        navigation.append(ui_button(
+            "back",
+            "«Предыдущая»",
+            callback_data=f"cfglist:{agg_key}:{page - 1}",
+            style=KeyboardButtonStyle.PRIMARY,
+        ))
+    if page + 1 < page_count:
+        navigation.append(ui_button(
+            "next",
+            "«Следующая»",
+            callback_data=f"cfglist:{agg_key}:{page + 1}",
+            style=KeyboardButtonStyle.PRIMARY,
+        ))
+    if navigation:
+        rows.append(navigation)
+    rows.append([
+        ui_button(
+            "download",
+            "«Скачать .txt-пакеты»",
+            callback_data=f"packages:{agg_key}",
+            style=KeyboardButtonStyle.SUCCESS,
+        )
+    ])
+    rows.append([
+        ui_button(
+            "back",
+            "«К спискам»",
+            callback_data=aggregate_back_target(agg_key),
+            style=KeyboardButtonStyle.PRIMARY,
+        )
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def config_list_text(agg_key: str, requested_page: int = 0) -> str:
+    aggregate = config.AGGREGATED_SUBS.get(agg_key, {})
+    configs, page, page_count = _config_page(agg_key, requested_page)
+    return (
+        f"<b>🧾 {html.escape(str(aggregate.get('profile_title', 'VLESS-конфиги')))}</b>\n\n"
+        f"Всего конфигов: <b>{len(configs)}</b>\n"
+        f"Страница: <b>{page + 1}/{page_count}</b>\n\n"
+        "Выбери конфиг, чтобы посмотреть параметры и проверить соединение."
+    )
+
+
+def config_detail_text(
+    agg_key: str,
+    link: str,
+    index: int,
+    *,
+    ping_status=None,
+) -> str:
+    configs = aggregate_configs(agg_key)
+    info = parse_vless_info(link)
+    raw_remark = str(info.get("remark") or "Без названия")
+    if info.get("error") or raw_remark.lower().startswith("vless://"):
+        raw_remark = "Без названия"
+    remark = html.escape(raw_remark)
+    host = html.escape(str(info.get("host") or "?"))
+    port = html.escape(str(info.get("port") or "?"))
+    transport = html.escape(str(info.get("type") or "tcp"))
+    security = html.escape(str(info.get("security") or "none"))
+    sni = html.escape(str(info.get("sni") or "—"))
+    if ping_status == "checking":
+        ping_line = "⏳ Проверяю TCP-соединение и задержку…"
+    elif isinstance(ping_status, int):
+        ping_line = f"✅ TCP-соединение установлено • <b>{ping_status} мс</b>"
+    elif ping_status == "failed":
+        ping_line = "❌ TCP-соединение не установлено за 3 секунды"
+    else:
+        ping_line = "📶 Соединение ещё не проверялось"
+    return (
+        f"<b>🔗 VLESS-конфиг {index + 1}/{len(configs)}</b>\n\n"
+        f"Название: <b>{remark}</b>\n"
+        f"Сервер: <code>{host}:{port}</code>\n"
+        f"Транспорт: <b>{transport}</b>\n"
+        f"Защита: <b>{security}</b>\n"
+        f"SNI: <code>{sni}</code>\n\n"
+        f"{ping_line}\n\n"
+        "<i>Проверка измеряет установку TCP-соединения, включая DNS, но не выполняет VLESS-авторизацию.</i>"
+    )
+
+
+def config_detail_keyboard(
+    agg_key: str,
+    link: str,
+    page: int,
+) -> InlineKeyboardMarkup:
+    token = config_token(link)
+    return InlineKeyboardMarkup([
+        [ui_button(
+            "ping",
+            "«Проверить соединение»",
+            callback_data=f"cfgping:{agg_key}:{token}:{page}",
+            style=KeyboardButtonStyle.SUCCESS,
+        )],
+        [ui_button(
+            "back",
+            "«К списку конфигов»",
+            callback_data=f"cfglist:{agg_key}:{page}",
+            style=KeyboardButtonStyle.PRIMARY,
+        )],
+    ])
+
+
+async def edit_config_message_content(query, text: str, reply_markup):
+    """Edit only caption/text, avoiding a redundant banner upload on ping/pages."""
+    rendered = render_html(text, config.CUSTOM_EMOJI_IDS)
+    try:
+        if getattr(query.message, "photo", None):
+            await query.message.edit_caption(
+                caption=rendered,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+            )
+        else:
+            await query.message.edit_text(
+                rendered,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+            )
+    except Exception as exc:
+        logger.warning("config message edit failed: %s", exc)
+        await edit_message_with_banner(query, "configs", text, reply_markup)
+
+
+async def show_config_list(
+    query,
+    agg_key: str,
+    page: int = 0,
+    *,
+    switch_banner: bool = False,
+):
+    text = config_list_text(agg_key, page)
+    keyboard = config_list_keyboard(agg_key, page)
+    if switch_banner:
+        await edit_message_with_banner(query, "configs", text, keyboard)
+    else:
+        await edit_config_message_content(query, text, keyboard)
+
+
+async def show_config_detail(query, agg_key: str, token: str, page: int, ping_status=None):
+    index, link = config_by_token(agg_key, token)
+    if link is None:
+        await edit_config_message_content(
+            query,
+            "<b>⚠️ Конфиг больше не найден</b>\n\nСписки успели обновиться. Открой актуальную страницу.",
+            back_keyboard(f"cfglist:{agg_key}:{page}"),
+        )
+        return None
+    await edit_config_message_content(
+        query,
+        config_detail_text(agg_key, link, index, ping_status=ping_status),
+        config_detail_keyboard(agg_key, link, page),
+    )
+    return link
+
+
 # ---------- Channel subscription check ----------
 
 async def is_user_subscribed(user_id: int, bot) -> bool:
@@ -531,6 +781,7 @@ def activate_aggregated_configs(results, chunk_map, proto_counts_map):
         filename: {
             "count": info["count"],
             "content": info["content"],
+            "configs": list(info.get("configs", [])),
         }
         for filename, info in results.items()
     }
@@ -576,7 +827,12 @@ async def notify_channel_update(bot, old_total, new_total):
         return
 
     now = datetime.now(MSK)
-    text = f"✅  • Списки обновлены\n\n🕔{now.strftime('%d.%m.%Y %H:%M МСК')}"
+    difference = int(new_total) - int(old_total)
+    difference_text = f"+{difference}" if difference > 0 else str(difference)
+    text = (
+        f"✅  • Списки обновлены ({difference_text})\n\n"
+        f"🕔{now.strftime('%d.%m.%Y %H:%M МСК')}"
+    )
     previous_id = SETTINGS.get("last_update_notification_id")
     try:
         sent = await bot.send_message(
@@ -616,7 +872,7 @@ async def _update_cache(categories=None, mode=None, bot=None):
     mode = mode or config.CHECK_MODE
     if categories is None:
         categories = list(config.SOURCES.keys())
-    old_total = sum(len(v.get("configs", [])) for v in CACHE.values()) if CACHE else 0
+    old_total = current_vless_count()
     result = await fetch_all(mode=mode, categories=categories)
     for key, data in result.items():
         # A provider outage must not erase a previously healthy source. Recheck
@@ -652,9 +908,10 @@ async def _update_cache(categories=None, mode=None, bot=None):
                 logger.error(f"save error {key}: {e}")
         CACHE[key] = data
     LAST_UPDATE = datetime.now(MSK)
-    new_total = sum(len(v.get("configs", [])) for v in CACHE.values())
     try:
         agg, chunk_map, proto_counts_map = build_aggregated_configs()
+        full_filename = config.AGGREGATED_SUBS["FULL"]["filename"]
+        new_total = int(agg.get(full_filename, {}).get("count", 0))
         if config.GITHUB_TOKEN and agg:
             # Keep the previous keyboard generation active until all new files
             # become visible together in one GitHub ref update.
@@ -894,7 +1151,7 @@ async def handle_admin_clean(query):
         except Exception:
             pass
 
-    total_before = sum(len(data.get("configs", [])) for data in CACHE.values())
+    total_before = current_vless_count()
     try:
         # This is a real refresh, not a second syntax pass over stale CACHE.
         # ``tcp`` first applies strict VLESS validation, then checks every
@@ -915,7 +1172,7 @@ async def handle_admin_clean(query):
         )
         return
 
-    total_after = sum(len(data.get("configs", [])) for data in CACHE.values())
+    total_after = current_vless_count()
     details = []
     unavailable = []
     for key, data in result.items():
@@ -933,8 +1190,8 @@ async def handle_admin_clean(query):
         "",
         "Источники загружены заново.",
         "Проверено: строгий VLESS URI + TCP host:port.",
-        f"В кэше было: <b>{total_before}</b>",
-        f"В кэше стало: <b>{total_after}</b>",
+        f"Уникальных VLESS было: <b>{total_before}</b>",
+        f"Уникальных VLESS стало: <b>{total_after}</b>",
     ]
     if details:
         report.extend(["", "<b>Изменения:</b>", *details[:20]])
@@ -1399,7 +1656,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Только для админа", show_alert=True)
             return
         clear_provider_input_state(context)
-        await edit_message_with_banner(query, "main", "<b>⚙️ Админ панель</b>\n\nВыбери действие:", admin_keyboard())
+        await edit_message_with_banner(query, "main", admin_panel_text(), admin_keyboard())
         return
 
     if data in (
@@ -1433,12 +1690,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "admin_stats":
             if not CACHE:
                 await update_cache(bot=context.bot)
-            lines = [f"<b>📊 Статистика</b>"]
-            total=0
-            for k,d in CACHE.items():
-                cnt=len(d.get("configs",[])); total+=cnt
-                lines.append(f"{k}: <b>{cnt}</b>")
-            lines.append(f"\nВсего VLESS: <b>{total}</b>")
+            lines = ["<b>📊 Статистика</b>"]
+            for key, source_data in CACHE.items():
+                count = len(source_data.get("configs", []))
+                lines.append(f"{key}: <b>{count}</b>")
+            lines.append(
+                f"\nУникальных VLESS в полном списке: <b>{current_vless_count()}</b>"
+            )
             await query.message.reply_text(
                 render_html("\n".join(lines), config.CUSTOM_EMOJI_IDS),
                 parse_mode=ParseMode.HTML,
@@ -1493,54 +1751,124 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("proto:"):
         try:
             _, agg_key, proto = data.split(":", 2)
-        except:
-            await query.answer("Ошибка", show_alert=True)
+        except ValueError:
+            await query.message.reply_text("Некорректный список конфигов.")
             return
+        if proto != "all" or agg_key not in config.AGGREGATED_SUBS:
+            await query.message.reply_text("Неизвестный список")
+            return
+        await show_config_list(query, agg_key, 0, switch_banner=True)
+        return
+
+    if data.startswith("cfglist:"):
+        try:
+            _, agg_key, page_text = data.split(":", 2)
+            page = int(page_text)
+        except (TypeError, ValueError):
+            await query.message.reply_text("Некорректная страница конфигов.")
+            return
+        if agg_key not in config.AGGREGATED_SUBS:
+            await query.message.reply_text("Неизвестный список")
+            return
+        await show_config_list(query, agg_key, page)
+        return
+
+    if data.startswith("cfgdetail:"):
+        try:
+            _, agg_key, token, page_text = data.split(":", 3)
+            page = int(page_text)
+        except (TypeError, ValueError):
+            await query.message.reply_text("Некорректный конфиг.")
+            return
+        await show_config_detail(query, agg_key, token, page)
+        return
+
+    if data.startswith("cfgping:"):
+        try:
+            _, agg_key, token, page_text = data.split(":", 3)
+            page = int(page_text)
+        except (TypeError, ValueError):
+            await query.message.reply_text("Некорректный конфиг.")
+            return
+        link = await show_config_detail(
+            query,
+            agg_key,
+            token,
+            page,
+            ping_status="checking",
+        )
+        if link is None:
+            return
+        info = parse_vless_info(link)
+        try:
+            port = int(info.get("port", 0))
+        except (TypeError, ValueError):
+            port = 0
+        latency_ms = await measure_tcp_latency(
+            str(info.get("host") or ""),
+            port,
+            timeout=3.0,
+        )
+        await show_config_detail(
+            query,
+            agg_key,
+            token,
+            page,
+            ping_status=latency_ms if latency_ms is not None else "failed",
+        )
+        return
+
+    if data.startswith("packages:"):
+        agg_key = data.split(":", 1)[1]
         agg = config.AGGREGATED_SUBS.get(agg_key)
         if not agg:
             await query.message.reply_text("Неизвестный список")
             return
-        base = agg["filename"]
-        base_title = agg["profile_title"]
-        fname = base
+        fname = agg["filename"]
         chunks = AGGREGATED_CHUNKS.get(fname, [])
         cnt = AGGREGATED_CACHE.get(fname, {}).get("count", "?")
-        back_target = agg_key.lower().replace("_full","")
-        if back_target not in ("white","black","full"):
-            back_target = "home"
         text = (
-            f"<b>📦 {base_title}</b>\n\n"
+            f"<b>📦 {html.escape(agg['profile_title'])}</b>\n\n"
             f"🔗 Всего VLESS: <b>{cnt}</b>\n\n"
             "Выбери пакет — бот отправит готовый <code>.txt</code>-файл."
         )
+        list_callback = f"cfglist:{agg_key}:0"
         if chunks:
-            kb = chunks_keyboard(fname, chunks, back_data=back_target, back_label="«К протоколам»")
-        else:
-            kb = InlineKeyboardMarkup(
-                [
-                    [ui_button(
-                        "download",
-                        "«Скачать .txt»",
-                        callback_data=f"rawfile:{fname}",
-                        style=KeyboardButtonStyle.SUCCESS,
-                    )],
-                    [ui_button(
-                        "back",
-                        "«К протоколам»",
-                        callback_data=back_target,
-                        style=KeyboardButtonStyle.PRIMARY,
-                    )],
-                ]
+            kb = chunks_keyboard(
+                fname,
+                chunks,
+                back_data=list_callback,
+                back_label="«К списку конфигов»",
             )
+        else:
+            kb = InlineKeyboardMarkup([
+                [ui_button(
+                    "download",
+                    "«Скачать .txt»",
+                    callback_data=f"rawfile:{fname}",
+                    style=KeyboardButtonStyle.SUCCESS,
+                )],
+                [ui_button(
+                    "back",
+                    "«К списку конфигов»",
+                    callback_data=list_callback,
+                    style=KeyboardButtonStyle.PRIMARY,
+                )],
+            ])
         await edit_message_with_banner(query, "configs", text, kb)
         return
 
     if data.startswith("chunk:"):
         fname = data.split(":", 1)[1]
+        aggregate_key, _ = aggregate_for_filename(fname)
         await send_chunk_file(
             query,
             fname,
-            back_data=aggregate_back_callback(fname),
+            back_data=(
+                f"cfglist:{aggregate_key}:0"
+                if aggregate_key
+                else aggregate_back_callback(fname)
+            ),
         )
         return
 
@@ -1548,10 +1876,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # link/base64/QR action now sends the corresponding .txt file instead.
     if data.startswith(("rawcopy:", "b64copy:", "qrfile:", "rawfile:")):
         fname = data.split(":", 1)[1]
+        aggregate_key, _ = aggregate_for_filename(fname)
         await send_chunk_file(
             query,
             fname,
-            back_data=aggregate_back_callback(fname),
+            back_data=(
+                f"cfglist:{aggregate_key}:0"
+                if aggregate_key
+                else aggregate_back_callback(fname)
+            ),
         )
         return
 

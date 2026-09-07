@@ -208,6 +208,22 @@ class AsyncValidationTests(unittest.IsolatedAsyncioTestCase):
             "vless://first-second",
         )
 
+    async def test_tcp_latency_is_measured_in_milliseconds(self):
+        moments = iter([10.0, 10.045])
+        writer = SimpleNamespace(close=lambda: None, wait_closed=AsyncMock())
+        fake_loop = SimpleNamespace(time=lambda: next(moments))
+        with (
+            patch.object(parser.asyncio, "get_running_loop", return_value=fake_loop),
+            patch.object(
+                parser.asyncio,
+                "open_connection",
+                AsyncMock(return_value=(None, writer)),
+            ),
+        ):
+            latency = await parser.measure_tcp_latency("example.com", 443)
+        self.assertEqual(latency, 45)
+        writer.wait_closed.assert_awaited_once()
+
     async def test_tcp_checks_each_unique_endpoint_once(self):
         one = vless(fragment="one")
         duplicate_endpoint = vless(
@@ -268,7 +284,7 @@ class AsyncValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["used_urls"], ["https://good.invalid"])
         self.assertEqual(fetch.await_count, 2)
 
-    async def test_discovery_downloads_valid_vless_from_found_feeds(self):
+    async def test_discovery_only_returns_valid_candidates_for_admin_approval(self):
         first_url = "https://raw.githubusercontent.com/new/feed/main/vless.txt"
         second_url = "https://raw.githubusercontent.com/new/feed/main/empty.txt"
         links = [
@@ -276,28 +292,26 @@ class AsyncValidationTests(unittest.IsolatedAsyncioTestCase):
             for index in range(1, 13)
         ]
 
-        async def fake_fetch(_session, url):
+        async def fake_fetch(_session, url, request_headers=None):
+            del request_headers
             if url == first_url:
                 return "\n".join([*links, "vmess://ignored"])
             return "not a subscription"
 
-        source = {"name": "discovery", "description": "test"}
-        with patch.object(
-            parser,
-            "discover_github_feed_urls",
-            AsyncMock(return_value=([first_url, second_url], [])),
+        with (
+            patch.object(
+                parser,
+                "discover_github_feed_urls",
+                AsyncMock(return_value=([first_url, second_url], [])),
+            ),
+            patch.object(parser, "fetch_text", AsyncMock(side_effect=fake_fetch)),
+            patch.object(parser, "DISCOVERY_MAX_CONFIGS", 7),
         ):
-            with patch.object(parser, "fetch_text", AsyncMock(side_effect=fake_fetch)):
-                with patch.object(parser, "DISCOVERY_MAX_CONFIGS", 7):
-                    result = await parser.fetch_discovered_category(
-                        None,
-                        "github_discovery",
-                        source,
-                        "syntax",
-                    )
-        self.assertEqual(result["configs"], links[:7])
-        self.assertEqual(result["used_urls"], [first_url])
-        self.assertEqual(result["raw_total"], len(links))
+            candidates, errors = await parser.find_public_github_candidates()
+        self.assertFalse(errors)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["url"], first_url)
+        self.assertEqual(candidates[0]["valid_count"], 7)
 
     async def test_discovery_uses_all_query_groups_and_multiple_repo_files(self):
         source = {
@@ -553,8 +567,13 @@ class SubscriptionTests(unittest.TestCase):
             (data_dir / "BLACK_FULL_1.txt").write_text("chunk", encoding="utf-8")
             stale = data_dir / "BLACK_FULL_6.txt"
             stale.write_text("stale", encoding="utf-8")
+            config_link = vless()
             results = {
-                "BLACK_FULL.txt": {"count": 1, "content": "main"},
+                "BLACK_FULL.txt": {
+                    "count": 1,
+                    "content": "main",
+                    "configs": [config_link],
+                },
                 "BLACK_FULL_1.txt": {"count": 1, "content": "chunk"},
             }
             chunk_map = {"BLACK_FULL.txt": [("BLACK_FULL_1.txt", "one", 1)]}
@@ -574,6 +593,10 @@ class SubscriptionTests(unittest.TestCase):
                     bot.AGGREGATED_CACHE["BLACK_FULL_1.txt"]["count"],
                     1,
                 )
+                self.assertEqual(
+                    bot.AGGREGATED_CACHE["BLACK_FULL.txt"]["configs"],
+                    [config_link],
+                )
                 self.assertNotIn(
                     "raw_url",
                     bot.AGGREGATED_CACHE["BLACK_FULL_1.txt"],
@@ -587,6 +610,72 @@ class SubscriptionTests(unittest.TestCase):
         self.assertTrue(github_sync._is_managed_path("BLACK_FULL_6.txt", groups))
         self.assertTrue(github_sync._is_managed_path("FULL_99.txt", groups))
         self.assertFalse(github_sync._is_managed_path("collection.txt", groups))
+
+
+class ConfigConnectivityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_config_result_edits_existing_caption_without_reuploading_banner(self):
+        message = SimpleNamespace(
+            photo=[SimpleNamespace()],
+            edit_caption=AsyncMock(),
+            edit_text=AsyncMock(),
+        )
+        query = SimpleNamespace(message=message)
+        with patch.dict(config.CUSTOM_EMOJI_IDS, {}, clear=True):
+            await bot.edit_config_message_content(query, "📶 Проверка", None)
+        message.edit_caption.assert_awaited_once_with(
+            caption="📶 Проверка",
+            parse_mode=ParseMode.HTML,
+            reply_markup=None,
+        )
+        message.edit_text.assert_not_awaited()
+
+    async def test_ping_callback_edits_same_config_message_before_and_after_check(self):
+        link = vless(fragment="Ping-Node")
+        token = bot.config_token(link)
+        query = SimpleNamespace(
+            data=f"cfgping:FULL:{token}:0",
+            from_user=SimpleNamespace(id=123, username="", first_name="User"),
+            answer=AsyncMock(),
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+        update = SimpleNamespace(callback_query=query)
+        context = SimpleNamespace(bot=SimpleNamespace(), user_data={})
+        with (
+            patch.object(bot, "is_user_subscribed", AsyncMock(return_value=True)),
+            patch.object(bot, "get_or_create_user"),
+            patch.object(
+                bot,
+                "show_config_detail",
+                AsyncMock(side_effect=[link, link]),
+            ) as show,
+            patch.object(bot, "measure_tcp_latency", AsyncMock(return_value=23)) as ping,
+        ):
+            await bot.callback_handler(update, context)
+        self.assertEqual(show.await_count, 2)
+        self.assertEqual(show.await_args_list[0].kwargs["ping_status"], "checking")
+        self.assertEqual(show.await_args_list[1].kwargs["ping_status"], 23)
+        ping.assert_awaited_once_with("example.com", 443, timeout=3.0)
+
+
+class AdminCountTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cleanup_report_uses_unique_full_counts(self):
+        query = SimpleNamespace(
+            message=SimpleNamespace(
+                edit_caption=AsyncMock(),
+                edit_text=AsyncMock(),
+            ),
+            get_bot=lambda: SimpleNamespace(),
+        )
+        with (
+            patch.object(bot, "current_vless_count", side_effect=[200, 177]),
+            patch.object(bot, "update_cache", AsyncMock(return_value={})),
+            patch.object(bot, "edit_message_with_banner", AsyncMock()) as edit,
+        ):
+            await bot.handle_admin_clean(query)
+        report = edit.await_args.args[2]
+        self.assertIn("Уникальных VLESS было: <b>200</b>", report)
+        self.assertIn("Уникальных VLESS стало: <b>177</b>", report)
+        self.assertNotIn("github_discovery", report)
 
 
 class NotificationAndSupportTests(unittest.IsolatedAsyncioTestCase):
@@ -614,7 +703,7 @@ class NotificationAndSupportTests(unittest.IsolatedAsyncioTestCase):
 
             fake_bot.send_message.assert_awaited_once_with(
                 chat_id=config.CHANNEL_ID,
-                text="✅  • Списки обновлены\n\n🕔07.09.2026 20:28 МСК",
+                text="✅  • Списки обновлены (+100)\n\n🕔07.09.2026 20:28 МСК",
                 parse_mode=ParseMode.HTML,
             )
             fake_bot.delete_message.assert_awaited_once_with(
@@ -626,6 +715,31 @@ class NotificationAndSupportTests(unittest.IsolatedAsyncioTestCase):
                 json.loads(settings_path.read_text(encoding="utf-8")),
                 settings,
             )
+
+    async def test_update_notice_shows_negative_difference(self):
+        fake_bot = SimpleNamespace(
+            send_message=AsyncMock(return_value=SimpleNamespace(message_id=88)),
+            delete_message=AsyncMock(),
+        )
+        fixed_datetime = SimpleNamespace(
+            now=lambda tz: datetime(2026, 9, 7, 20, 28, tzinfo=tz)
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(bot, "SETTINGS_FILE", Path(directory) / "settings.json"),
+                patch.object(
+                    bot,
+                    "SETTINGS",
+                    {"update_notifications": True, "last_update_notification_id": None},
+                ),
+                patch.object(bot, "datetime", fixed_datetime),
+                patch.dict(config.CUSTOM_EMOJI_IDS, {}, clear=True),
+            ):
+                await bot.notify_channel_update(fake_bot, 200, 177)
+        self.assertEqual(
+            fake_bot.send_message.await_args.kwargs["text"],
+            "✅  • Списки обновлены (-23)\n\n🕔07.09.2026 20:28 МСК",
+        )
 
     async def test_disabled_update_notices_send_nothing(self):
         fake_bot = SimpleNamespace(
@@ -917,11 +1031,12 @@ class SourceRegistryTests(unittest.TestCase):
         self.assertIn("aetris_vpn", config.AGGREGATED_SUBS["FULL"]["source_keys"])
         self.assertNotIn("aetris_vpn", config.AGGREGATED_SUBS["WHITE_FULL"]["source_keys"])
 
-    def test_strict_github_discovery_is_enabled_and_bounded(self):
-        self.assertTrue(config.AUTO_DISCOVERY)
-        self.assertTrue(config.SOURCES["github_discovery"]["discovery"])
-        self.assertIn("github_discovery", config.BLACK_SOURCE_KEYS)
-        self.assertIn("github_discovery", config.FULL_SOURCE_KEYS)
+    def test_github_search_is_manual_approval_only_and_bounded(self):
+        self.assertNotIn("github_discovery", config.SOURCES)
+        self.assertNotIn("github_discovery", config.WHITE_SOURCE_KEYS)
+        self.assertNotIn("github_discovery", config.BLACK_SOURCE_KEYS)
+        self.assertNotIn("github_discovery", config.FULL_SOURCE_KEYS)
+        self.assertGreaterEqual(len(config.PUBLIC_GITHUB_SEARCH["search_queries"]), 8)
         self.assertLessEqual(config.DISCOVERY_MAX_FEEDS, 16)
         self.assertLessEqual(config.DISCOVERY_MAX_CONFIGS, 3000)
 
@@ -985,6 +1100,68 @@ class SourceRegistryTests(unittest.TestCase):
             bot.extract_custom_emoji_ids(message),
             ["sticker-id", "text-id", "caption-id"],
         )
+
+    def test_config_list_is_paginated_and_keeps_txt_delivery(self):
+        links = [
+            vless(host=f"node{index}.example.com", fragment=f"Node-{index}")
+            for index in range(10)
+        ]
+        with (
+            patch.object(
+                bot,
+                "AGGREGATED_CACHE",
+                {
+                    "FULL.txt": {
+                        "count": len(links),
+                        "content": "",
+                        "configs": links,
+                    }
+                },
+            ),
+            patch.dict(config.CUSTOM_EMOJI_IDS, {}, clear=True),
+        ):
+            keyboard = bot.config_list_keyboard("FULL", 0)
+            text = bot.config_list_text("FULL", 0)
+        buttons = [button for row in keyboard.inline_keyboard for button in row]
+        config_buttons = [
+            button for button in buttons if (button.callback_data or "").startswith("cfgdetail:")
+        ]
+        self.assertEqual(len(config_buttons), bot.CONFIGS_PER_PAGE)
+        self.assertTrue(any((button.callback_data or "").startswith("cfglist:FULL:1") for button in buttons))
+        self.assertTrue(any(button.callback_data == "packages:FULL" for button in buttons))
+        self.assertIn("Страница: <b>1/2</b>", text)
+        self.assertNotIn("vless://", " ".join(button.text for button in buttons))
+        self.assertTrue(all(button.style is not None for button in buttons))
+
+    def test_config_detail_has_in_message_tcp_ping_control(self):
+        link = vless(fragment="Fast-Node")
+        with (
+            patch.object(
+                bot,
+                "AGGREGATED_CACHE",
+                {"FULL.txt": {"count": 1, "content": "", "configs": [link]}},
+            ),
+            patch.dict(config.CUSTOM_EMOJI_IDS, {}, clear=True),
+        ):
+            text = bot.config_detail_text("FULL", link, 0, ping_status=42)
+            keyboard = bot.config_detail_keyboard("FULL", link, 0)
+        self.assertIn("TCP-соединение установлено", text)
+        self.assertIn("42 мс", text)
+        self.assertNotIn("vless://", text)
+        ping_button = keyboard.inline_keyboard[0][0]
+        self.assertTrue(ping_button.callback_data.startswith("cfgping:FULL:"))
+        self.assertEqual(ping_button.style, KeyboardButtonStyle.SUCCESS)
+
+    def test_admin_panel_displays_current_unique_vless_count(self):
+        with patch.object(
+            bot,
+            "AGGREGATED_CACHE",
+            {"FULL.txt": {"count": 321, "content": "", "configs": []}},
+        ):
+            self.assertIn(
+                "Текущее количество VLESS-конфигов: <b>321</b>",
+                bot.admin_panel_text(),
+            )
 
     def test_interface_offers_files_without_subscription_links(self):
         bot_source = (ROOT / "src" / "bot.py").read_text(encoding="utf-8")
