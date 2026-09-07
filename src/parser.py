@@ -16,6 +16,7 @@ from config import (
     AUTO_DISCOVERY,
     DISCOVERY_MAX_CONFIGS,
     DISCOVERY_MAX_FEEDS,
+    DISCOVERY_MAX_FILES_PER_REPO,
     DISCOVERY_MAX_REPOS,
     DISCOVERY_MIN_VALID,
     GITHUB_REPO,
@@ -476,7 +477,7 @@ async def fetch_text(
 
 
 def _discovery_url_score(url: str) -> int:
-    """Accept only GitHub files matching strict VLESS/VPN/list filters."""
+    """Rank public GitHub text files related to VPN configs and subscriptions."""
     parsed = urlsplit(url)
     if (parsed.hostname or "").lower() != "raw.githubusercontent.com":
         return -100
@@ -492,24 +493,46 @@ def _discovery_url_score(url: str) -> int:
     file_tokens = set(re.split(r"[^a-z0-9]+", "/".join(parts[3:])))
     if file_tokens & DISCOVERY_EXCLUDED_NAMES:
         return -100
-    searchable = "/".join([parts[1], *parts[3:]])
-    if "vless" not in searchable:
+    searchable = "/".join([parts[0], parts[1], *parts[3:]])
+    vpn_markers = ("vless", "vpn", "proxy", "xray", "sing-box", "singbox")
+    feed_markers = (
+        "config",
+        "subscription",
+        "subscribe",
+        "sub",
+        "feed",
+        "list",
+        "whitelist",
+        "blacklist",
+        "white",
+        "black",
+    )
+    if not any(term in searchable for term in vpn_markers):
         return -100
-    secondary_filters = ("vpn", "config", "subscription", "sub", "list", "blacklist")
-    if not any(term in searchable for term in secondary_filters):
+    if not any(term in searchable for term in feed_markers):
         return -100
 
-    score = 20
+    score = 10
+    if "vless" in searchable:
+        score += 30
+    if "vpn" in searchable:
+        score += 18
+    if "xray" in searchable or "singbox" in searchable or "sing-box" in searchable:
+        score += 10
     if "blacklist" in searchable or "black" in file_tokens:
         score += 12
-    if "vpn" in searchable:
-        score += 8
+    if "whitelist" in searchable or "white" in file_tokens:
+        score += 12
     if "config" in searchable:
-        score += 6
+        score += 8
     if "list" in searchable:
-        score += 5
-    if "subscription" in searchable or "sub" in file_tokens:
+        score += 6
+    if "subscription" in searchable or "subscribe" in searchable or "sub" in file_tokens:
+        score += 6
+    if suffix == ".txt":
         score += 4
+    if stem in {"all", "full", "general", "vless", "configs", "config", "subscription"}:
+        score += 3
     return score
 
 
@@ -537,15 +560,16 @@ async def discover_github_feed_urls(
 ) -> Tuple[List[str], List[str]]:
     """Find a bounded set of public feeds through GitHub search only.
 
-    Repository and file paths must match strict VLESS/VPN/config/list filters.
-    Every downloaded payload then passes the normal VLESS validator.
+    Repository and file paths must match VPN/proxy plus config/subscription/
+    white/black/list filters. Every payload then passes the VLESS validator.
     """
     if not AUTO_DISCOVERY:
         return [], ["автопоиск отключён"]
 
     errors = []
     candidates = []
-    repositories = {}
+    repository_buckets = []
+    globally_seen_repositories = set()
     for query in source.get("search_queries", []):
         search_url = "https://api.github.com/search/repositories?" + urlencode(
             {
@@ -559,21 +583,40 @@ async def discover_github_feed_urls(
         if not isinstance(payload, dict):
             errors.append(f"GitHub search — ошибка запроса: {query}")
             continue
+        bucket = []
         for item in payload.get("items", []):
             if not isinstance(item, dict):
                 continue
             full_name = item.get("full_name", "")
+            lowered = full_name.lower()
             if (
                 full_name
-                and full_name.lower() != GITHUB_REPO.lower()
+                and lowered != GITHUB_REPO.lower()
+                and lowered not in globally_seen_repositories
                 and not item.get("archived")
                 and not item.get("disabled")
+                and not item.get("private")
             ):
+                globally_seen_repositories.add(lowered)
+                bucket.append((full_name, item))
+        repository_buckets.append(bucket)
+
+    # Select repositories round-robin so whitelist, blacklist, subscription,
+    # config, and general VPN queries all contribute within the global limit.
+    repositories = {}
+    position = 0
+    while len(repositories) < DISCOVERY_MAX_REPOS:
+        added = False
+        for bucket in repository_buckets:
+            if position < len(bucket):
+                full_name, item = bucket[position]
                 repositories.setdefault(full_name, item)
-            if len(repositories) >= DISCOVERY_MAX_REPOS:
-                break
-        if len(repositories) >= DISCOVERY_MAX_REPOS:
+                added = True
+                if len(repositories) >= DISCOVERY_MAX_REPOS:
+                    break
+        if not added:
             break
+        position += 1
 
     for full_name, repository in list(repositories.items())[:DISCOVERY_MAX_REPOS]:
         branch = repository.get("default_branch") or "main"
@@ -601,7 +644,10 @@ async def discover_github_feed_urls(
             if score >= 1:
                 ranked.append((score, download_url))
         candidates.extend(
-            url for _, url in sorted(ranked, key=lambda item: (-item[0], item[1]))[:2]
+            url
+            for _, url in sorted(ranked, key=lambda item: (-item[0], item[1]))[
+                :DISCOVERY_MAX_FILES_PER_REPO
+            ]
         )
 
     configured_urls = {
@@ -626,8 +672,9 @@ async def discover_github_feed_urls(
         # independent sources rather than another file/mirror from the same repo.
         if repository in configured_repositories:
             continue
-        # Keep one feed per repository so mirrors cannot dominate the result.
-        if per_repository[repository] >= 1:
+        # Keep a bounded number per repository so one large mirror cannot
+        # dominate, while still parsing several independent feeds it exposes.
+        if per_repository[repository] >= DISCOVERY_MAX_FILES_PER_REPO:
             continue
         per_repository[repository] += 1
         seen.add(url)
@@ -779,7 +826,7 @@ async def find_public_github_candidates() -> Tuple[List[Dict], List[str]]:
     """Run strict bounded discovery for admin approval without adding sources."""
     source = SOURCES.get("github_discovery")
     if not source:
-        return [], ["Строгий GitHub-поиск отключён в настройках"]
+        return [], ["Расширенный GitHub-поиск отключён в настройках"]
     connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
     async with aiohttp.ClientSession(connector=connector) as session:
         urls, errors = await discover_github_feed_urls(session, source)

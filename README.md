@@ -12,7 +12,7 @@ Telegram-бот собирает публичные VLESS-конфигураци
 
 Белые GitHub feed-ы: zieng2, igareck, CID VPN, ByeWhiteLists 2.0 и Ghost VPN. Чёрные GitHub feed-ы: igareck, Ghost VPN и AetrisVPN.
 
-Дополнительный строгий `github_discovery` использует GitHub Repository Search и Git Tree API. Репозиторий и путь файла должны одновременно соответствовать VLESS и дополнительным фильтрам `vpn`, `config`, `subscription`, `list` или `blacklist`. Берётся не больше одного feed-а из одного репозитория, максимум 8 feed-ов и 1200 уникальных конфигураций за обновление. Каждый найденный feed принимается только при наличии минимум 10 валидных VLESS.
+Дополнительный `github_discovery` использует GitHub Repository Search и Git Tree API. Поиск проходит отдельными группами по VLESS, VPN, proxy/Xray, subscription, config, white/whitelist, black/blacklist и list, поэтому слово `vless` не обязано присутствовать в названии самого файла. Из каждого репозитория проверяется до 3 подходящих feed-ов; за обновление — до 12 репозиториев, 16 feed-ов и 3000 уникальных конфигураций. Даже для смешанного VPN-feed-а в результат попадают исключительно синтаксически валидные VLESS.
 
 ### Управление провайдерами из бота
 
@@ -134,10 +134,11 @@ docker logs -f vless-parser-bot
 | `CHECK_MODE` | `none`, `syntax` или `tcp` | `syntax` |
 | `UPDATE_INTERVAL` | Интервал автообновления, минут | `60` |
 | `AUTO_DISCOVERY` | Автопоиск новых публичных GitHub VLESS feed-ов | `true` |
-| `DISCOVERY_MAX_REPOS` | Максимум GitHub-репозиториев за один поиск | `6` |
-| `DISCOVERY_MAX_FEEDS` | Максимум найденных файлов за обновление | `8` |
-| `DISCOVERY_MIN_VALID` | Минимум валидных VLESS для принятия feed-а | `10` |
-| `DISCOVERY_MAX_CONFIGS` | Максимум конфигураций из автопоиска | `1200` |
+| `DISCOVERY_MAX_REPOS` | Максимум GitHub-репозиториев за один поиск | `12` |
+| `DISCOVERY_MAX_FEEDS` | Максимум найденных файлов за обновление | `16` |
+| `DISCOVERY_MAX_FILES_PER_REPO` | Максимум feed-файлов из одного репозитория | `3` |
+| `DISCOVERY_MIN_VALID` | Минимум валидных VLESS для принятия feed-а | `1` |
+| `DISCOVERY_MAX_CONFIGS` | Максимум конфигураций из автопоиска | `3000` |
 | `GITHUB_TOKEN` | Fine-grained токен с Contents read/write для агрегатов и `providers.json` | — |
 | `GITHUB_REPO` | Репозиторий агрегатов | `xznexil3/vless-parser-bot` |
 | `GITHUB_BRANCH` | Ветка публикации `.txt`-файлов | `main` |
@@ -146,7 +147,7 @@ docker logs -f vless-parser-bot
 ## 🧠 Pipeline
 
 ```text
-selected GitHub feeds + approved providers.json + strict filtered GitHub discovery
+selected GitHub feeds + approved providers.json + expanded bounded GitHub discovery
   → bounded fetch
   → plain / escaped / base64 extraction
   → strict VLESS validation

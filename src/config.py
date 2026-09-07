@@ -32,12 +32,16 @@ AUTO_DISCOVERY = os.getenv("AUTO_DISCOVERY", "true").strip().lower() not in {
     "no",
     "off",
 }
-DISCOVERY_MAX_REPOS = max(1, min(int(os.getenv("DISCOVERY_MAX_REPOS", "6")), 12))
-DISCOVERY_MAX_FEEDS = max(1, min(int(os.getenv("DISCOVERY_MAX_FEEDS", "8")), 16))
-DISCOVERY_MIN_VALID = max(1, min(int(os.getenv("DISCOVERY_MIN_VALID", "10")), 100))
+DISCOVERY_MAX_REPOS = max(1, min(int(os.getenv("DISCOVERY_MAX_REPOS", "12")), 24))
+DISCOVERY_MAX_FEEDS = max(1, min(int(os.getenv("DISCOVERY_MAX_FEEDS", "16")), 16))
+DISCOVERY_MAX_FILES_PER_REPO = max(
+    1,
+    min(int(os.getenv("DISCOVERY_MAX_FILES_PER_REPO", "3")), 5),
+)
+DISCOVERY_MIN_VALID = max(1, min(int(os.getenv("DISCOVERY_MIN_VALID", "1")), 100))
 DISCOVERY_MAX_CONFIGS = max(
     100,
-    min(int(os.getenv("DISCOVERY_MAX_CONFIGS", "1200")), 3000),
+    min(int(os.getenv("DISCOVERY_MAX_CONFIGS", "3000")), 3000),
 )
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", os.getenv("GH_TOKEN", ""))
@@ -142,13 +146,18 @@ SOURCES = {
         ],
     },
     "github_discovery": {
-        "name": "Строгий GitHub-поиск VLESS",
-        "description": "Поиск VLESS/VPN/config/list/blacklist feed-ов",
+        "name": "Расширенный GitHub-поиск VPN/VLESS",
+        "description": "Широкий ограниченный поиск публичных VPN/VLESS feed-ов на GitHub",
         "discovery": True,
         "search_queries": [
-            "vless vpn config blacklist in:name,description,readme stars:>5",
-            "vless vpn config list in:name,description,readme stars:>10",
-            "vless subscription blacklist in:name,description,readme stars:>3",
+            "vless vpn config in:name,description,readme",
+            "vless subscription in:name,description,readme",
+            "vless config list in:name,description,readme",
+            "vpn subscription config in:name,description,readme",
+            "vpn whitelist config in:name,description,readme",
+            "vpn blacklist config in:name,description,readme",
+            "vless white list in:name,description,readme",
+            "vless black list in:name,description,readme",
         ],
         "urls": [],
     },
@@ -280,4 +289,4 @@ SOURCES_TEXT = """<b>🗂️ Источники VLESS</b>
 
 Используются только GitHub feed-ы: zieng2, igareck, CID VPN, ByeWhiteLists 2.0, Ghost VPN, AetrisVPN, одобренные администратором провайдеры и строгий GitHub-поиск.
 
-🔎 Поиск учитывает слова VLESS, VPN, config, subscription, list и blacklist. Широкие collection/index-источники отключены. Из файлов принимаются только корректные <b>VLESS</b>; дубликаты удаляются."""
+🔎 Поиск охватывает VLESS, VPN, proxy/Xray, config, subscription, white/whitelist, black/blacklist и list. Широкие collection/index-источники не подключаются напрямую: бот проверяет найденные GitHub-файлы. Из содержимого принимаются только корректные <b>VLESS</b>; дубликаты удаляются."""

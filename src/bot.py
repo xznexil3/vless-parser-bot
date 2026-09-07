@@ -1165,7 +1165,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 query,
                 "main",
                 "<b>🔎 Поиск публичных источников</b>\n\n"
-                "Ищу на GitHub по строгим фильтрам VLESS + VPN/config/subscription/list/blacklist. "
+                "Ищу публичные GitHub-репозитории и файлы по VPN, VLESS, proxy/Xray, "
+                "config, subscription, white/black и list. Из содержимого беру только валидные VLESS. "
                 "Ничего не будет добавлено без подтверждения.",
                 back_keyboard("admin_providers"),
             )

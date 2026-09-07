@@ -160,6 +160,18 @@ class ExtractionTests(unittest.TestCase):
             "main/blacklist_vless_config.txt"
         )
         self.assertGreater(parser._discovery_url_score(accepted), 0)
+        self.assertGreater(
+            parser._discovery_url_score(
+                "https://raw.githubusercontent.com/owner/public-vpn/main/general_configs.txt"
+            ),
+            0,
+        )
+        self.assertGreater(
+            parser._discovery_url_score(
+                "https://raw.githubusercontent.com/owner/xray-proxy/main/white-list.txt"
+            ),
+            0,
+        )
         self.assertLess(
             parser._discovery_url_score(
                 "https://raw.githubusercontent.com/owner/repo/main/configs.txt"
@@ -286,6 +298,49 @@ class AsyncValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["configs"], links[:7])
         self.assertEqual(result["used_urls"], [first_url])
         self.assertEqual(result["raw_total"], len(links))
+
+    async def test_discovery_uses_all_query_groups_and_multiple_repo_files(self):
+        source = {
+            "search_queries": ["vpn subscription", "vpn whitelist"],
+        }
+        seen_searches = []
+
+        async def fake_json(_session, url):
+            if "/search/repositories?" in url:
+                seen_searches.append(url)
+                repo = "owner/vpn-one" if "subscription" in url else "owner/vpn-two"
+                return {
+                    "items": [
+                        {
+                            "full_name": repo,
+                            "default_branch": "main",
+                            "archived": False,
+                            "disabled": False,
+                            "private": False,
+                        }
+                    ]
+                }
+            if "/git/trees/" in url:
+                return {
+                    "tree": [
+                        {"type": "blob", "path": "configs.txt", "size": 100},
+                        {"type": "blob", "path": "white-list.txt", "size": 100},
+                    ]
+                }
+            raise AssertionError(url)
+
+        with (
+            patch.object(parser, "_fetch_json", AsyncMock(side_effect=fake_json)),
+            patch.object(parser, "DISCOVERY_MAX_REPOS", 2),
+            patch.object(parser, "DISCOVERY_MAX_FEEDS", 4),
+            patch.object(parser, "DISCOVERY_MAX_FILES_PER_REPO", 2),
+        ):
+            urls, errors = await parser.discover_github_feed_urls(None, source)
+        self.assertEqual(len(seen_searches), 2)
+        self.assertEqual(len(urls), 4)
+        self.assertFalse(errors)
+        self.assertTrue(any("vpn-one" in url for url in urls))
+        self.assertTrue(any("vpn-two" in url for url in urls))
 
 
 class HealthEndpointTests(unittest.IsolatedAsyncioTestCase):
