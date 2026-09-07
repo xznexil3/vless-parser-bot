@@ -53,14 +53,61 @@ ASSETS_DIR.mkdir(exist_ok=True)
 
 CACHE = {}
 LAST_UPDATE = None
-LAST_NOTIFY = None  # для троттлинга уведомлений раз в час
+LAST_NOTIFY = None  # timestamp of the latest channel update notice
 AGGREGATED_CACHE = {}
 AGGREGATED_CHUNKS = {}
 AGGREGATED_PROTO_COUNTS = {}
 UPDATE_LOCK = asyncio.Lock()
 USERS_FILE = DATA_DIR / "users.json"
+SETTINGS_FILE = DATA_DIR / "settings.json"
+DEFAULT_SETTINGS = {
+    "update_notifications": True,
+    "last_update_notification_id": None,
+}
 
 MSK = timezone(timedelta(hours=3))
+
+
+def load_settings():
+    settings = dict(DEFAULT_SETTINGS)
+    try:
+        if SETTINGS_FILE.exists():
+            stored = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            if isinstance(stored, dict):
+                settings.update(
+                    {
+                        key: stored[key]
+                        for key in DEFAULT_SETTINGS
+                        if key in stored
+                    }
+                )
+    except (OSError, json.JSONDecodeError, TypeError) as exc:
+        logger.warning("load settings failed: %s", exc)
+    return settings
+
+
+def save_settings():
+    try:
+        temporary = SETTINGS_FILE.with_name(f"{SETTINGS_FILE.name}.tmp")
+        temporary.write_text(
+            json.dumps(SETTINGS, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(SETTINGS_FILE)
+    except OSError as exc:
+        logger.error("save settings failed: %s", exc)
+
+
+SETTINGS = load_settings()
+
+
+def update_notifications_enabled() -> bool:
+    return bool(SETTINGS.get("update_notifications", True))
+
+
+def set_update_notifications(enabled: bool):
+    SETTINGS["update_notifications"] = bool(enabled)
+    save_settings()
 
 
 def ui_button(icon: str, text: str, **kwargs):
@@ -124,6 +171,7 @@ def main_keyboard(user_id: int = None):
         ],
         [ui_button("full", "«Полный список»", callback_data="full", style=KeyboardButtonStyle.SUCCESS)],
         [ui_button("help", "«Помощь»", callback_data="help", style=KeyboardButtonStyle.DANGER)],
+        [ui_button("chat", "«Поддержка»", callback_data="support", style=KeyboardButtonStyle.DANGER)],
     ]
     if user_id and config.is_admin(user_id):
         kb.append([
@@ -133,6 +181,13 @@ def main_keyboard(user_id: int = None):
 
 
 def admin_keyboard():
+    notifications_on = update_notifications_enabled()
+    notification_label = (
+        "«Уведомления: ВКЛ»" if notifications_on else "«Уведомления: ВЫКЛ»"
+    )
+    notification_style = (
+        KeyboardButtonStyle.SUCCESS if notifications_on else KeyboardButtonStyle.DANGER
+    )
     return InlineKeyboardMarkup(
         [
             [
@@ -140,6 +195,12 @@ def admin_keyboard():
                 ui_button("refresh", "«Обновить кэш»", callback_data="admin_refresh", style=KeyboardButtonStyle.SUCCESS),
             ],
             [ui_button("clean", "«Проверка и очистка»", callback_data="admin_clean", style=KeyboardButtonStyle.DANGER)],
+            [ui_button(
+                "notifications",
+                notification_label,
+                callback_data="admin_notifications",
+                style=notification_style,
+            )],
             [ui_button("sources", "«Источники»", callback_data="admin_sources", style=KeyboardButtonStyle.PRIMARY)],
             [ui_button("back", "«Назад»", callback_data="home", style=KeyboardButtonStyle.PRIMARY)],
         ]
@@ -159,6 +220,33 @@ def back_keyboard(callback_data: str = "home") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [ui_button("back", "«Назад»", callback_data=callback_data, style=KeyboardButtonStyle.PRIMARY)]
     ])
+
+
+def support_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [ui_button(
+            "back",
+            "«Закрыть поддержку»",
+            callback_data="support_close",
+            style=KeyboardButtonStyle.PRIMARY,
+        )]
+    ])
+
+
+def support_reply_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [ui_button(
+            "chat",
+            "«Ответить»",
+            callback_data=f"support_reply:{user_id}",
+            style=KeyboardButtonStyle.SUCCESS,
+        )]
+    ])
+
+
+def clear_support_state(context):
+    context.user_data.pop("support_mode", None)
+    context.user_data.pop("support_reply_to", None)
 
 
 def chunks_keyboard(
@@ -346,25 +434,40 @@ async def push_aggregated_to_github(aggregated_results):
         return {}
 
 async def notify_channel_update(bot, old_total, new_total):
-    """Уведомление в канал @vpncrimson об обновлении списков — каждый раз когда обновляю кэш"""
+    """Replace the previous channel update notice with the newest one."""
     global LAST_NOTIFY
-    if not config.CHANNEL_ID:
+    if not config.CHANNEL_ID or not update_notifications_enabled():
         return
+
     now = datetime.now(MSK)
+    text = f"✅  • Списки обновлены\n\n🕔{now.strftime('%d.%m.%Y %H:%M МСК')}"
+    previous_id = SETTINGS.get("last_update_notification_id")
     try:
-        diff = new_total - old_total
-        sign = f"+{diff}" if diff > 0 else str(diff) if diff != 0 else "0"
-        text = (
-            f"<b>Free VPN • Crimson — списки обновлены</b>\n\n"
-            f"Всего VLESS: <b>{new_total}</b> ({sign})\n"
-            f"Дата: {now.strftime('%d.%m.%Y %H:%M МСК')}\n\n"
-            f"Получить — @wtfparsbot"
+        sent = await bot.send_message(
+            chat_id=config.CHANNEL_ID,
+            text=render_html(text, config.CUSTOM_EMOJI_IDS),
+            parse_mode=ParseMode.HTML,
         )
-        await bot.send_message(chat_id=config.CHANNEL_ID, text=text, parse_mode=ParseMode.HTML)
+        new_message_id = getattr(sent, "message_id", None)
+        if previous_id and previous_id != new_message_id:
+            try:
+                await bot.delete_message(
+                    chat_id=config.CHANNEL_ID,
+                    message_id=int(previous_id),
+                )
+            except Exception as exc:
+                logger.warning("Could not delete previous update notice: %s", exc)
+        SETTINGS["last_update_notification_id"] = new_message_id
+        save_settings()
         LAST_NOTIFY = now
-        logger.info(f"Notified channel {config.CHANNEL_ID} about update {old_total}->{new_total}")
-    except Exception as e:
-        logger.warning(f"Channel notify failed: {e}")
+        logger.info(
+            "Replaced channel update notice for %s (%s -> %s VLESS)",
+            config.CHANNEL_ID,
+            old_total,
+            new_total,
+        )
+    except Exception as exc:
+        logger.warning("Channel notify failed: %s", exc)
 
 async def update_cache(categories=None, mode=None, bot=None):
     """Serialize refreshes so cache, files, and rendered chunk buttons agree."""
@@ -421,9 +524,9 @@ async def _update_cache(categories=None, mode=None, bot=None):
             # become visible together in one GitHub ref update.
             await push_aggregated_to_github(agg)
         activate_aggregated_configs(agg, chunk_map, proto_counts_map)
-        # Уведомление в канал раз в час, если есть изменения
-        if bot and old_total != new_total:
-            asyncio.create_task(notify_channel_update(bot, old_total, new_total))
+        # Every completed refresh replaces the previous channel notice.
+        if bot:
+            await notify_channel_update(bot, old_total, new_total)
     except Exception as e:
         logger.error(f"aggregated error: {e}")
     return result
@@ -513,6 +616,7 @@ async def send_initial_banner(update: Update, banner_name: str, text: str, reply
 # ---------- Handlers ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_support_state(context)
     uid = update.effective_user.id if update.effective_user else None
     user = update.effective_user
     get_or_create_user(uid, user.username if user else "", user.first_name if user else "")
@@ -534,6 +638,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_initial_banner(update, "main", config.WELCOME_TEXT, main_keyboard(uid))
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_support_state(context)
     uid = update.effective_user.id if update.effective_user else None
     if not await is_user_subscribed(uid, context.bot):
         await update.message.reply_text(f"📢 Подпишись на {config.CHANNEL_USERNAME}, чтобы продолжить", reply_markup=sub_required_keyboard())
@@ -544,7 +649,15 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def extract_custom_emoji_ids(message) -> list[str]:
     """Read custom emoji identifiers from a message sent or forwarded to the bot."""
     result = []
-    for entity in message.entities or []:
+    sticker = getattr(message, "sticker", None)
+    sticker_custom_id = getattr(sticker, "custom_emoji_id", None)
+    if sticker_custom_id:
+        result.append(sticker_custom_id)
+    entities = [
+        *list(getattr(message, "entities", None) or []),
+        *list(getattr(message, "caption_entities", None) or []),
+    ]
+    for entity in entities:
         if entity.type == MessageEntityType.CUSTOM_EMOJI and entity.custom_emoji_id:
             if entity.custom_emoji_id not in result:
                 result.append(entity.custom_emoji_id)
@@ -553,6 +666,7 @@ def extract_custom_emoji_ids(message) -> list[str]:
 
 async def handle_main_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_main_menu_text(update.message.text):
+        clear_support_state(context)
         uid = update.effective_user.id if update.effective_user else None
         if not await is_user_subscribed(uid, context.bot):
             await update.message.reply_text(f"📢 Подпишись на {config.CHANNEL_USERNAME}", reply_markup=sub_required_keyboard())
@@ -646,7 +760,7 @@ async def handle_admin_clean(query):
         # This is a real refresh, not a second syntax pass over stale CACHE.
         # ``tcp`` first applies strict VLESS validation, then checks every
         # unique host:port and removes configs on unreachable endpoints.
-        result = await update_cache(mode="tcp", bot=None)
+        result = await update_cache(mode="tcp", bot=query.get_bot())
     except Exception as exc:
         logger.exception("admin validation and cleanup failed")
         await edit_message_with_banner(
@@ -731,6 +845,49 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 sub_required_keyboard())
         return
 
+    if data == "support":
+        context.user_data["support_mode"] = True
+        context.user_data.pop("support_reply_to", None)
+        text = (
+            "<b>💬 Поддержка</b>\n\n"
+            "Напиши сообщение прямо сюда. Можно отправить текст, фотографию, "
+            "документ, видео, голосовое сообщение или стикер.\n\n"
+            "Команда поддержки получит обращение, а ответ придёт в этот чат."
+        )
+        await edit_message_with_banner(query, "help", text, support_keyboard())
+        return
+
+    if data == "support_close":
+        clear_support_state(context)
+        await edit_message_with_banner(query, "main", config.WELCOME_TEXT, main_keyboard(uid))
+        return
+
+    if data.startswith("support_reply:"):
+        if not config.is_admin(uid):
+            await query.answer("Только для админа", show_alert=True)
+            return
+        try:
+            target_user_id = int(data.split(":", 1)[1])
+        except (TypeError, ValueError):
+            await query.answer("Некорректный пользователь", show_alert=True)
+            return
+        context.user_data["support_reply_to"] = target_user_id
+        context.user_data.pop("support_mode", None)
+        await query.message.reply_text(
+            render_html(
+                f"<b>💬 Ответ пользователю</b> <code>{target_user_id}</code>\n\n"
+                "Отправь текст, файл, фотографию, видео, голосовое сообщение или стикер. "
+                "Бот доставит ответ без раскрытия личного аккаунта администратора.",
+                config.CUSTOM_EMOJI_IDS,
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=back_keyboard("admin_panel"),
+        )
+        return
+
+    # Any regular navigation action closes an unfinished support input mode.
+    clear_support_state(context)
+
     if data == "home":
         await edit_message_with_banner(query, "main", config.WELCOME_TEXT, main_keyboard(uid))
         return
@@ -775,9 +932,26 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await edit_message_with_banner(query, "main", "<b>⚙️ Админ панель</b>\n\nВыбери действие:", admin_keyboard())
         return
 
-    if data in ("admin_stats", "admin_refresh", "admin_sources", "admin_clean"):
+    if data in (
+        "admin_stats",
+        "admin_refresh",
+        "admin_sources",
+        "admin_clean",
+        "admin_notifications",
+    ):
         if not config.is_admin(uid):
             await query.answer("Только для админа", show_alert=True)
+            return
+        if data == "admin_notifications":
+            enabled = not update_notifications_enabled()
+            set_update_notifications(enabled)
+            status = "включены" if enabled else "выключены"
+            await edit_message_with_banner(
+                query,
+                "main",
+                f"<b>🔔 Админ панель</b>\n\nУведомления обновления списков <b>{status}</b>.",
+                admin_keyboard(),
+            )
             return
         if data == "admin_sources":
             await query.message.reply_text(
@@ -913,6 +1087,86 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Message handlers ----------
 
+async def relay_support_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Relay user messages and admin replies without exposing admin accounts."""
+    message = update.effective_message
+    user = update.effective_user
+    if message is None or user is None:
+        return False
+
+    user_id = user.id
+    reply_target = context.user_data.get("support_reply_to")
+    if reply_target and config.is_admin(user_id):
+        try:
+            await context.bot.send_message(
+                chat_id=int(reply_target),
+                text=render_html("💬 <b>Ответ поддержки</b>", config.CUSTOM_EMOJI_IDS),
+                parse_mode=ParseMode.HTML,
+            )
+            await context.bot.copy_message(
+                chat_id=int(reply_target),
+                from_chat_id=message.chat_id,
+                message_id=message.message_id,
+            )
+            await message.reply_text(
+                render_html(
+                    "✅ Ответ отправлен пользователю. Можно отправить следующее сообщение "
+                    "или вернуться в админ-панель.",
+                    config.CUSTOM_EMOJI_IDS,
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=back_keyboard("admin_panel"),
+            )
+        except Exception as exc:
+            logger.warning("Support reply delivery failed: %s", exc)
+            await message.reply_text(
+                "❌ Не удалось доставить ответ. Возможно, пользователь заблокировал бота.",
+                reply_markup=back_keyboard("admin_panel"),
+            )
+        return True
+
+    if not context.user_data.get("support_mode"):
+        return False
+
+    delivered = 0
+    for admin_id in sorted(config.ADMIN_IDS):
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=render_html(
+                    "💬 <b>Новое обращение в поддержку</b>\n\n"
+                    f"🆔 ID пользователя: <code>{user_id}</code>",
+                    config.CUSTOM_EMOJI_IDS,
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            await context.bot.copy_message(
+                chat_id=admin_id,
+                from_chat_id=message.chat_id,
+                message_id=message.message_id,
+                reply_markup=support_reply_keyboard(user_id),
+            )
+            delivered += 1
+        except Exception as exc:
+            logger.warning("Support message delivery to %s failed: %s", admin_id, exc)
+
+    if delivered:
+        await message.reply_text(
+            render_html(
+                "✅ Сообщение передано поддержке. Ответ придёт в этот чат.",
+                config.CUSTOM_EMOJI_IDS,
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=support_keyboard(),
+        )
+    else:
+        await message.reply_text(
+            "❌ Сейчас не удалось связаться с поддержкой. Попробуй немного позже.",
+            reply_markup=support_keyboard(),
+        )
+    return True
+
+
 async def message_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else 0
     user = update.effective_user
@@ -924,6 +1178,14 @@ async def message_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     text = (update.message.text or "").strip()
+    if is_main_menu_text(text):
+        clear_support_state(context)
+        await send_initial_banner(update, "main", config.WELCOME_TEXT, main_keyboard(uid))
+        return
+
+    if await relay_support_message(update, context):
+        return
+
     custom_ids = extract_custom_emoji_ids(update.message)
     if custom_ids:
         rows = [
@@ -938,9 +1200,7 @@ async def message_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             reply_markup=main_keyboard(uid),
         )
         return
-    if is_main_menu_text(text):
-        await send_initial_banner(update, "main", config.WELCOME_TEXT, main_keyboard(uid))
-        return
+
     if "vless://" in text:
         import re
         m = re.search(r'vless://[^\s]+', text)
@@ -959,7 +1219,10 @@ def main():
         return
     app = Application.builder().token(config.BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_text_handler))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, message_text_handler)
+    )
     app.add_handler(CallbackQueryHandler(callback_handler))
     print(f"Crimson bot @vpncrimson интервальный {config.UPDATE_INTERVAL}м — только .txt на репо")
 

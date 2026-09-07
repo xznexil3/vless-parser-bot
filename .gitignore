@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 .env
 data/*.txt
+data/*.json
+data/*.tmp
 !data/.gitkeep
 .idea/
 .vscode/

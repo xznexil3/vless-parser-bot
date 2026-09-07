@@ -1,8 +1,10 @@
 import asyncio
 import base64
+import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -18,7 +20,7 @@ import github_sync  # noqa: E402
 import health  # noqa: E402
 import parser  # noqa: E402
 import subscription  # noqa: E402
-from telegram.constants import KeyboardButtonStyle  # noqa: E402
+from telegram.constants import KeyboardButtonStyle, ParseMode  # noqa: E402
 
 
 UUID = "123e4567-e89b-42d3-a456-426614174000"
@@ -480,6 +482,123 @@ class SubscriptionTests(unittest.TestCase):
         self.assertFalse(github_sync._is_managed_path("collection.txt", groups))
 
 
+class NotificationAndSupportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_update_notice_replaces_previous_message_with_exact_format(self):
+        fake_bot = SimpleNamespace(
+            send_message=AsyncMock(return_value=SimpleNamespace(message_id=77)),
+            delete_message=AsyncMock(),
+        )
+        fixed_datetime = SimpleNamespace(
+            now=lambda tz: datetime(2026, 9, 7, 20, 28, tzinfo=tz)
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.json"
+            settings = {
+                "update_notifications": True,
+                "last_update_notification_id": 55,
+            }
+            with (
+                patch.object(bot, "SETTINGS_FILE", settings_path),
+                patch.object(bot, "SETTINGS", settings),
+                patch.object(bot, "datetime", fixed_datetime),
+                patch.dict(config.CUSTOM_EMOJI_IDS, {}, clear=True),
+            ):
+                await bot.notify_channel_update(fake_bot, 100, 200)
+
+            fake_bot.send_message.assert_awaited_once_with(
+                chat_id=config.CHANNEL_ID,
+                text="✅  • Списки обновлены\n\n🕔07.09.2026 20:28 МСК",
+                parse_mode=ParseMode.HTML,
+            )
+            fake_bot.delete_message.assert_awaited_once_with(
+                chat_id=config.CHANNEL_ID,
+                message_id=55,
+            )
+            self.assertEqual(settings["last_update_notification_id"], 77)
+            self.assertEqual(
+                json.loads(settings_path.read_text(encoding="utf-8")),
+                settings,
+            )
+
+    async def test_disabled_update_notices_send_nothing(self):
+        fake_bot = SimpleNamespace(
+            send_message=AsyncMock(),
+            delete_message=AsyncMock(),
+        )
+        with patch.object(
+            bot,
+            "SETTINGS",
+            {"update_notifications": False, "last_update_notification_id": 55},
+        ):
+            await bot.notify_channel_update(fake_bot, 100, 200)
+        fake_bot.send_message.assert_not_awaited()
+        fake_bot.delete_message.assert_not_awaited()
+
+    async def test_user_support_message_is_relayed_to_admin(self):
+        message = SimpleNamespace(
+            chat_id=123,
+            message_id=456,
+            reply_text=AsyncMock(),
+        )
+        update = SimpleNamespace(
+            effective_message=message,
+            effective_user=SimpleNamespace(id=123),
+        )
+        fake_bot = SimpleNamespace(
+            send_message=AsyncMock(),
+            copy_message=AsyncMock(),
+        )
+        context = SimpleNamespace(user_data={"support_mode": True}, bot=fake_bot)
+        with patch.object(config, "ADMIN_IDS", {999}):
+            handled = await bot.relay_support_message(update, context)
+
+        self.assertTrue(handled)
+        fake_bot.send_message.assert_awaited_once()
+        self.assertEqual(fake_bot.send_message.await_args.kwargs["chat_id"], 999)
+        fake_bot.copy_message.assert_awaited_once()
+        copy_kwargs = fake_bot.copy_message.await_args.kwargs
+        self.assertEqual(copy_kwargs["chat_id"], 999)
+        self.assertEqual(copy_kwargs["from_chat_id"], 123)
+        self.assertEqual(copy_kwargs["message_id"], 456)
+        reply_button = copy_kwargs["reply_markup"].inline_keyboard[0][0]
+        self.assertEqual(reply_button.callback_data, "support_reply:123")
+        message.reply_text.assert_awaited_once()
+
+    async def test_admin_support_reply_is_delivered_anonymously(self):
+        message = SimpleNamespace(
+            chat_id=999,
+            message_id=654,
+            reply_text=AsyncMock(),
+        )
+        update = SimpleNamespace(
+            effective_message=message,
+            effective_user=SimpleNamespace(id=999),
+        )
+        fake_bot = SimpleNamespace(
+            send_message=AsyncMock(),
+            copy_message=AsyncMock(),
+        )
+        context = SimpleNamespace(user_data={"support_reply_to": 123}, bot=fake_bot)
+        with (
+            patch.object(config, "ADMIN_IDS", {999}),
+            patch.dict(config.CUSTOM_EMOJI_IDS, {}, clear=True),
+        ):
+            handled = await bot.relay_support_message(update, context)
+
+        self.assertTrue(handled)
+        fake_bot.send_message.assert_awaited_once_with(
+            chat_id=123,
+            text="💬 <b>Ответ поддержки</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        fake_bot.copy_message.assert_awaited_once_with(
+            chat_id=123,
+            from_chat_id=999,
+            message_id=654,
+        )
+        message.reply_text.assert_awaited_once()
+
+
 class SourceRegistryTests(unittest.TestCase):
     def test_only_selected_github_sources_are_registered(self):
         self.assertNotIn("collection", config.SOURCES)
@@ -539,6 +658,7 @@ class SourceRegistryTests(unittest.TestCase):
             "black": ("⬛", KeyboardButtonStyle.SUCCESS),
             "full": ("📚", KeyboardButtonStyle.SUCCESS),
             "help": ("❔", KeyboardButtonStyle.DANGER),
+            "support": ("💬", KeyboardButtonStyle.DANGER),
             "admin_panel": ("⚙️", KeyboardButtonStyle.DANGER),
         }
         for callback_data, (icon, style) in expected.items():
@@ -567,6 +687,21 @@ class SourceRegistryTests(unittest.TestCase):
                 '<tg-emoji emoji-id="custom-profile-id">👤</tg-emoji> <b>Профиль</b>',
             )
 
+    def test_custom_emoji_ids_are_read_from_entities_captions_and_stickers(self):
+        custom_type = bot.MessageEntityType.CUSTOM_EMOJI
+        message = SimpleNamespace(
+            sticker=SimpleNamespace(custom_emoji_id="sticker-id"),
+            entities=[SimpleNamespace(type=custom_type, custom_emoji_id="text-id")],
+            caption_entities=[
+                SimpleNamespace(type=custom_type, custom_emoji_id="caption-id"),
+                SimpleNamespace(type=custom_type, custom_emoji_id="sticker-id"),
+            ],
+        )
+        self.assertEqual(
+            bot.extract_custom_emoji_ids(message),
+            ["sticker-id", "text-id", "caption-id"],
+        )
+
     def test_interface_offers_files_without_subscription_links(self):
         bot_source = (ROOT / "src" / "bot.py").read_text(encoding="utf-8")
         self.assertNotIn("get_raw_url", bot_source)
@@ -586,6 +721,49 @@ class SourceRegistryTests(unittest.TestCase):
         self.assertEqual(bot.aggregate_back_callback("BLACK_FULL_6.txt"), "black")
         with patch.object(bot, "AGGREGATED_CACHE", {"BLACK_FULL.txt": {}}):
             self.assertIsNone(bot.local_subscription_path("BLACK_FULL_6.txt"))
+
+    def test_banner_uses_key_and_owner_username_is_not_exposed(self):
+        self.assertIn("🔑 Free VPN • Crimson", config.WELCOME_TEXT)
+        self.assertNotIn("🛰", config.WELCOME_TEXT)
+        self.assertEqual(bot.icon_text("network", "Main"), "🔑 Main")
+        bot_text = (ROOT / "src" / "bot.py").read_text(encoding="utf-8")
+        config_text = (ROOT / "src" / "config.py").read_text(encoding="utf-8")
+        self.assertNotIn("unnervin", bot_text.lower())
+        self.assertNotIn("unnervin", config_text.lower())
+        self.assertIn("«Поддержка»", config.HELP_TEXT)
+
+    def test_admin_notification_toggle_button_reflects_setting(self):
+        with patch.object(
+            bot,
+            "SETTINGS",
+            {"update_notifications": True, "last_update_notification_id": None},
+        ):
+            enabled = {
+                button.callback_data: button
+                for row in bot.admin_keyboard().inline_keyboard
+                for button in row
+            }
+        self.assertEqual(
+            enabled["admin_notifications"].style,
+            KeyboardButtonStyle.SUCCESS,
+        )
+        self.assertIn("Уведомления: ВКЛ", enabled["admin_notifications"].text)
+
+        with patch.object(
+            bot,
+            "SETTINGS",
+            {"update_notifications": False, "last_update_notification_id": None},
+        ):
+            disabled = {
+                button.callback_data: button
+                for row in bot.admin_keyboard().inline_keyboard
+                for button in row
+            }
+        self.assertEqual(
+            disabled["admin_notifications"].style,
+            KeyboardButtonStyle.DANGER,
+        )
+        self.assertIn("Уведомления: ВЫКЛ", disabled["admin_notifications"].text)
 
     def test_custom_subscription_builder_is_fully_removed(self):
         checked_files = [
