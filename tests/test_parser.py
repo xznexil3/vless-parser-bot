@@ -19,9 +19,10 @@ import config  # noqa: E402
 import github_sync  # noqa: E402
 import health  # noqa: E402
 import parser  # noqa: E402
+import paid_subscriptions  # noqa: E402
 import provider_registry  # noqa: E402
 import subscription  # noqa: E402
-from telegram.constants import KeyboardButtonStyle, ParseMode  # noqa: E402
+from telegram.constants import ParseMode  # noqa: E402
 
 
 UUID = "123e4567-e89b-42d3-a456-426614174000"
@@ -763,7 +764,11 @@ class NotificationAndSupportTests(unittest.IsolatedAsyncioTestCase):
         )
         update = SimpleNamespace(
             effective_message=message,
-            effective_user=SimpleNamespace(id=123),
+            effective_user=SimpleNamespace(
+                id=123,
+                username="crimson_user",
+                full_name="Crimson Nick",
+            ),
         )
         fake_bot = SimpleNamespace(
             send_message=AsyncMock(),
@@ -776,6 +781,13 @@ class NotificationAndSupportTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(handled)
         fake_bot.send_message.assert_awaited_once()
         self.assertEqual(fake_bot.send_message.await_args.kwargs["chat_id"], 999)
+        self.assertEqual(
+            fake_bot.send_message.await_args.kwargs["text"],
+            "💬 <b>Новое обращение в поддержку</b>\n\n"
+            "🆔 ID пользователя: <code>123</code>\n\n"
+            "🔗 Юзернейм: <b>@crimson_user</b>\n\n"
+            "👤 Ник: <b>Crimson Nick</b>",
+        )
         fake_bot.copy_message.assert_awaited_once()
         copy_kwargs = fake_bot.copy_message.await_args.kwargs
         self.assertEqual(copy_kwargs["chat_id"], 999)
@@ -818,6 +830,153 @@ class NotificationAndSupportTests(unittest.IsolatedAsyncioTestCase):
             message_id=654,
         )
         message.reply_text.assert_awaited_once()
+
+
+class PaidSubscriptionTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def plan(**overrides):
+        values = {
+            "name": "White Premium",
+            "category": "white",
+            "stars_price": 125,
+            "description": "Stable VLESS list",
+            "created_at": "2026-09-07T21:00:00+03:00",
+            "delivery_url": "https://example.com/paid/subscription",
+        }
+        values.update(overrides)
+        return paid_subscriptions.build_paid_plan(**values)
+
+    async def test_paid_registry_catalog_and_admin_controls(self):
+        plan = self.plan()
+        with tempfile.TemporaryDirectory() as directory:
+            registry = Path(directory) / "paid_subscriptions.json"
+            paid_subscriptions.save_paid_registry([plan], registry)
+            with (
+                patch.object(bot, "PAID_REGISTRY_FILE", registry),
+                patch.dict(config.CUSTOM_EMOJI_IDS, {}, clear=True),
+            ):
+                catalog = bot.paid_catalog_text()
+                buttons = [
+                    button
+                    for row in bot.paid_catalog_keyboard().inline_keyboard
+                    for button in row
+                ]
+                detail = bot.paid_plan_text(plan)
+                admin_buttons = [
+                    button
+                    for row in bot.admin_paid_plan_keyboard(plan).inline_keyboard
+                    for button in row
+                ]
+        self.assertIn("Белые списки: <b>1</b>", catalog)
+        self.assertTrue(any(button.callback_data == "paidcat:white" for button in buttons))
+        self.assertIn("125 XTR", detail)
+        self.assertNotIn(plan["delivery_url"], detail)
+        self.assertTrue(any(button.callback_data.startswith("paidadminfile:") for button in admin_buttons))
+        self.assertTrue(any(button.callback_data.startswith("paidadminlink:") for button in admin_buttons))
+        self.assertTrue(all(button.style is None for button in [*buttons, *admin_buttons]))
+
+    async def test_paid_plan_callback_creates_real_stars_invoice(self):
+        plan = self.plan()
+        query = SimpleNamespace(
+            data=f"paystars:{plan['id']}",
+            from_user=SimpleNamespace(id=123, username="buyer", first_name="Buyer"),
+            answer=AsyncMock(),
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+        fake_bot = SimpleNamespace(send_invoice=AsyncMock())
+        context = SimpleNamespace(bot=fake_bot, user_data={})
+        update = SimpleNamespace(callback_query=query)
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(bot, "is_user_subscribed", AsyncMock(return_value=True)),
+            patch.object(bot, "get_or_create_user"),
+        ):
+            registry = Path(directory) / "paid_subscriptions.json"
+            paid_subscriptions.save_paid_registry([plan], registry)
+            with patch.object(bot, "PAID_REGISTRY_FILE", registry):
+                await bot.callback_handler(update, context)
+        kwargs = fake_bot.send_invoice.await_args.kwargs
+        self.assertEqual(kwargs["currency"], "XTR")
+        self.assertEqual(kwargs["provider_token"], "")
+        self.assertEqual(kwargs["payload"], f"paid:{plan['id']}:123")
+        self.assertEqual(kwargs["prices"][0].amount, 125)
+
+    async def test_stars_precheckout_validates_user_plan_and_exact_price(self):
+        plan = self.plan()
+        precheckout = SimpleNamespace(
+            invoice_payload=f"paid:{plan['id']}:123",
+            from_user=SimpleNamespace(id=123),
+            currency="XTR",
+            total_amount=125,
+            answer=AsyncMock(),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            registry = Path(directory) / "paid_subscriptions.json"
+            paid_subscriptions.save_paid_registry([plan], registry)
+            with patch.object(bot, "PAID_REGISTRY_FILE", registry):
+                await bot.paid_precheckout_handler(
+                    SimpleNamespace(pre_checkout_query=precheckout),
+                    SimpleNamespace(),
+                )
+                precheckout.answer.assert_awaited_once_with(ok=True)
+                precheckout.total_amount = 124
+                precheckout.answer.reset_mock()
+                await bot.paid_precheckout_handler(
+                    SimpleNamespace(pre_checkout_query=precheckout),
+                    SimpleNamespace(),
+                )
+        self.assertFalse(precheckout.answer.await_args.kwargs["ok"])
+
+    async def test_successful_stars_payment_delivers_once_and_records_order(self):
+        plan = self.plan()
+        payment = SimpleNamespace(
+            invoice_payload=f"paid:{plan['id']}:123",
+            telegram_payment_charge_id="charge-123",
+            currency="XTR",
+            total_amount=125,
+        )
+        message = SimpleNamespace(successful_payment=payment, reply_text=AsyncMock())
+        update = SimpleNamespace(
+            effective_message=message,
+            effective_user=SimpleNamespace(id=123),
+        )
+        context = SimpleNamespace(bot=SimpleNamespace())
+        saved = {}
+        with tempfile.TemporaryDirectory() as directory:
+            registry = Path(directory) / "paid_subscriptions.json"
+            paid_subscriptions.save_paid_registry([plan], registry)
+            with (
+                patch.object(bot, "PAID_REGISTRY_FILE", registry),
+                patch.object(bot, "load_paid_orders", return_value={}),
+                patch.object(bot, "save_paid_orders", side_effect=lambda value: saved.update(value)),
+                patch.object(bot, "deliver_paid_plan", AsyncMock(return_value=True)) as deliver,
+            ):
+                await bot.paid_successful_payment_handler(update, context)
+        deliver.assert_awaited_once_with(context.bot, 123, plan)
+        self.assertTrue(saved["stars:charge-123"]["delivered"])
+        self.assertEqual(saved["stars:charge-123"]["plan_id"], plan["id"])
+
+    async def test_paid_txt_upload_keeps_only_valid_vless(self):
+        good = vless(fragment="Paid-Node")
+        telegram_file = SimpleNamespace(
+            download_as_bytearray=AsyncMock(
+                return_value=bytearray(f"{good}\nvmess://ignored\nvless://broken".encode())
+            )
+        )
+        document = SimpleNamespace(
+            file_name="premium.txt",
+            file_size=100,
+            get_file=AsyncMock(return_value=telegram_file),
+        )
+        content = await bot.read_paid_document(document)
+        self.assertIn(good, content)
+        self.assertNotIn("vmess://", content)
+        self.assertNotIn("vless://broken", content)
+        self.assertIn("# Количество: 1", content)
+
+    def test_paid_registry_rejects_credential_urls(self):
+        with self.assertRaises(ValueError):
+            self.plan(delivery_url="https://user:secret@example.com/sub")
 
 
 class DynamicProviderRegistryTests(unittest.TestCase):
@@ -919,18 +1078,9 @@ class DynamicProviderRegistryTests(unittest.TestCase):
             for row in keyboard.inline_keyboard
             for button in row
         }
-        self.assertEqual(
-            buttons["provider_accept:abcd1234:white"].style,
-            KeyboardButtonStyle.SUCCESS,
-        )
-        self.assertEqual(
-            buttons["provider_accept:abcd1234:black"].style,
-            KeyboardButtonStyle.SUCCESS,
-        )
-        self.assertEqual(
-            buttons["provider_skip:abcd1234"].style,
-            KeyboardButtonStyle.DANGER,
-        )
+        self.assertIsNone(buttons["provider_accept:abcd1234:white"].style)
+        self.assertIsNone(buttons["provider_accept:abcd1234:black"].style)
+        self.assertIsNone(buttons["provider_skip:abcd1234"].style)
 
     def test_repository_candidate_ranking_remains_vless_vpn_bounded(self):
         self.assertGreater(
@@ -1045,30 +1195,31 @@ class SourceRegistryTests(unittest.TestCase):
         self.assertIn('"«Проверка и очистка»"', bot_source)
         self.assertNotIn("Проверку и очистку", bot_source)
 
-    def test_main_and_navigation_button_styles_and_unicode_icons(self):
+    def test_inline_buttons_are_neutral_and_keep_unicode_icons(self):
         main_buttons = {
             button.callback_data: button
             for row in bot.main_keyboard(config.ADMIN_ID).inline_keyboard
             for button in row
         }
         expected = {
-            "profile": ("👤", KeyboardButtonStyle.PRIMARY),
-            "white": ("⬜", KeyboardButtonStyle.SUCCESS),
-            "black": ("⬛", KeyboardButtonStyle.SUCCESS),
-            "full": ("📚", KeyboardButtonStyle.SUCCESS),
-            "help": ("❔", KeyboardButtonStyle.DANGER),
-            "support": ("💬", KeyboardButtonStyle.DANGER),
-            "admin_panel": ("⚙️", KeyboardButtonStyle.DANGER),
+            "profile": "👤",
+            "white": "⬜",
+            "black": "⬛",
+            "full": "📚",
+            "paid": "💎",
+            "help": "❔",
+            "support": "💬",
+            "admin_panel": "⚙️",
         }
-        for callback_data, (icon, style) in expected.items():
+        for callback_data, icon in expected.items():
             with self.subTest(callback_data=callback_data):
                 self.assertTrue(main_buttons[callback_data].text.startswith(icon))
-                self.assertEqual(main_buttons[callback_data].style, style)
+                self.assertIsNone(main_buttons[callback_data].style)
                 self.assertIsNone(main_buttons[callback_data].api_kwargs.get("icon_custom_emoji_id"))
 
         back = bot.back_keyboard("admin_panel").inline_keyboard[0][0]
         self.assertTrue(back.text.startswith("◀️"))
-        self.assertEqual(back.style, KeyboardButtonStyle.PRIMARY)
+        self.assertIsNone(back.style)
         self.assertIsNone(back.api_kwargs.get("icon_custom_emoji_id"))
 
     def test_configured_custom_emoji_id_is_sent_to_button_and_html(self):
@@ -1131,7 +1282,7 @@ class SourceRegistryTests(unittest.TestCase):
         self.assertTrue(any(button.callback_data == "packages:FULL" for button in buttons))
         self.assertIn("Страница: <b>1/2</b>", text)
         self.assertNotIn("vless://", " ".join(button.text for button in buttons))
-        self.assertTrue(all(button.style is not None for button in buttons))
+        self.assertTrue(all(button.style is None for button in buttons))
 
     def test_config_detail_has_in_message_tcp_ping_control(self):
         link = vless(fragment="Fast-Node")
@@ -1150,7 +1301,7 @@ class SourceRegistryTests(unittest.TestCase):
         self.assertNotIn("vless://", text)
         ping_button = keyboard.inline_keyboard[0][0]
         self.assertTrue(ping_button.callback_data.startswith("cfgping:FULL:"))
-        self.assertEqual(ping_button.style, KeyboardButtonStyle.SUCCESS)
+        self.assertIsNone(ping_button.style)
 
     def test_admin_panel_displays_current_unique_vless_count(self):
         with patch.object(
@@ -1204,19 +1355,11 @@ class SourceRegistryTests(unittest.TestCase):
                 for row in bot.admin_keyboard().inline_keyboard
                 for button in row
             }
-        self.assertEqual(
-            enabled["admin_notifications"].style,
-            KeyboardButtonStyle.SUCCESS,
-        )
+        self.assertIsNone(enabled["admin_notifications"].style)
         self.assertIn("Уведомления: ВКЛ", enabled["admin_notifications"].text)
-        self.assertEqual(
-            enabled["admin_providers"].style,
-            KeyboardButtonStyle.PRIMARY,
-        )
-        self.assertEqual(
-            enabled["admin_discovery"].style,
-            KeyboardButtonStyle.SUCCESS,
-        )
+        self.assertIsNone(enabled["admin_providers"].style)
+        self.assertIsNone(enabled["admin_discovery"].style)
+        self.assertIsNone(enabled["admin_paid"].style)
 
         with patch.object(
             bot,
@@ -1228,10 +1371,7 @@ class SourceRegistryTests(unittest.TestCase):
                 for row in bot.admin_keyboard().inline_keyboard
                 for button in row
             }
-        self.assertEqual(
-            disabled["admin_notifications"].style,
-            KeyboardButtonStyle.DANGER,
-        )
+        self.assertIsNone(disabled["admin_notifications"].style)
         self.assertIn("Уведомления: ВЫКЛ", disabled["admin_notifications"].text)
 
     def test_custom_subscription_builder_is_fully_removed(self):

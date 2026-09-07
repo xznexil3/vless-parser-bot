@@ -1,4 +1,4 @@
-"""UI helpers for Bot API 9.4 emoji and styled buttons.
+"""UI helpers for emoji and neutral/default inline buttons.
 
 With no configured IDs, the module uses standard Unicode emoji.  If
 ``CUSTOM_EMOJI_IDS`` is filled in, it sends ``icon_custom_emoji_id`` on buttons
@@ -51,6 +51,8 @@ ICONS = {
     "search": "🔎",
     "calendar": "🗓️",
     "id": "🆔",
+    "premium": "💎",
+    "stars": "⭐",
 }
 
 
@@ -66,10 +68,9 @@ def button(
     *,
     callback_data: str | None = None,
     url: str | None = None,
-    style: str | None = None,
     custom_emoji_id: str | None = None,
 ) -> InlineKeyboardButton:
-    """Build a Bot API 9.4 button with optional custom emoji.
+    """Build a neutral inline button with optional custom emoji.
 
     When ``custom_emoji_id`` is configured, Telegram renders it in the icon
     slot and the visible label contains no Unicode fallback.  With no ID, the
@@ -83,8 +84,7 @@ def button(
         kwargs["callback_data"] = callback_data
     if url is not None:
         kwargs["url"] = url
-    if style is not None:
-        kwargs["style"] = style
+    # Inline buttons intentionally use Telegram's neutral/default appearance.
     if custom_emoji_id:
         kwargs["icon_custom_emoji_id"] = custom_emoji_id
     return InlineKeyboardButton(**kwargs)

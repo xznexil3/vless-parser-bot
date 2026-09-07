@@ -26,7 +26,15 @@ Telegram-бот собирает публичные VLESS-конфигураци
 - реестр хранится в `providers.json` и при наличии токена публикуется в GitHub без force-push, поэтому переживает Railway redeploy;
 - для записи реестра `GITHUB_TOKEN` должен иметь доступ на запись Contents к `GITHUB_REPO`; без него изменение применяется локально, а бот явно предупреждает, что оно может исчезнуть после redeploy.
 
-Закрытые, платные, украденные и требующие чужой авторизации subscription-ссылки не ищутся и не принимаются. Смешанные публичные feed-ы дают только прошедшие проверку VLESS.
+Закрытые, украденные и требующие чужой авторизации provider-ссылки не ищутся и не принимаются. Смешанные публичные feed-ы дают только прошедшие проверку VLESS.
+
+### Платные подписки
+
+Главное меню содержит отдельный каталог «Платные подписки» с белыми и чёрными планами. Администратор создаёт план пошагово: категория, название, цена в Telegram Stars, описание и содержимое. Содержимым может быть проверяемый UTF-8 `.txt` с VLESS или HTTPS-ссылка; второй вариант можно добавить позже из карточки плана. План можно включить, выключить или удалить.
+
+Для цифровых товаров внутри Telegram используется настоящий счёт с валютой `XTR`. Перед оплатой бот повторно сверяет пользователя, план, цену и доступность выдаваемого содержимого; после `successful_payment` выдаёт файл/ссылку и защищается от повторной обработки одного платежа. Команда `/paysupport` всегда открывает поддержку по оплате. Crypto Pay внутри бота не подключается: правила Telegram требуют оплачивать цифровые товары и услуги исключительно Stars.
+
+Платные файлы и ссылки намеренно не публикуются в публичном GitHub. `PAID_STORAGE_DIR` нужно подключить к приватному Railway Volume, иначе данные локальной файловой системы исчезнут после redeploy.
 
 ## ✅ Извлечение и проверка
 
@@ -62,9 +70,9 @@ TCP-проверка подтверждает доступность endpoint-а
 
 ## ✨ Возможности
 
-- интерактивное Telegram-меню с цветными inline-кнопками Bot API 9.4;
+- интерактивное Telegram-меню с нейтральными inline-кнопками без цветовых стилей;
 - стандартные Unicode-эмодзи на inline/reply-кнопках и в сообщениях — видны всем пользователям без Premium и Fragment;
-- семантические цвета: синий для навигации, зелёный для списков/скачивания, красный для помощи, админки и очистки;
+- каталог платных белых/чёрных подписок со встроенной оплатой Telegram Stars;
 - отдельные `WHITE_FULL.txt`, `BLACK_FULL.txt` и `FULL.txt`;
 - отправка только обычных `.txt`-файлов, без URL, base64 и QR;
 - памятка по импорту файла в разделе помощи и после выбора пакета;
@@ -103,11 +111,11 @@ pip install -r requirements.txt
 python src/bot.py
 ```
 
-Проект использует `python-telegram-bot 22.8` для поддержки `style` кнопок Bot API 9.4.
+Проект использует `python-telegram-bot 22.8`; inline-кнопки намеренно отображаются без параметра `style`.
 
 ### Custom Emoji и режим без Premium
 
-По умолчанию используются обычные Unicode-эмодзи (`⬜`, `⬛`, `📚`, `✅` и т. п.) в тексте кнопок и сообщений. Это не требует ни Telegram Premium у владельца, ни дополнительного username бота на Fragment. Цветовые стили `primary`, `success` и `danger` также применяются отдельно.
+По умолчанию используются обычные Unicode-эмодзи (`⬜`, `⬛`, `📚`, `✅` и т. п.) в тексте кнопок и сообщений. Это не требует ни Telegram Premium у владельца, ни дополнительного username бота на Fragment. Параметры цветовых стилей `primary`, `success` и `danger` для inline-кнопок не отправляются.
 
 Для проверки настоящих custom emoji можно передать ID через JSON-переменную `CUSTOM_EMOJI_IDS`:
 
@@ -136,6 +144,7 @@ docker logs -f vless-parser-bot
 | `REQUIRED_CHANNEL` | Канал для проверки подписки пользователя | `@vpncrimson` |
 | `CHECK_MODE` | `none`, `syntax` или `tcp` | `syntax` |
 | `UPDATE_INTERVAL` | Интервал автообновления, минут | `60` |
+| `PAID_STORAGE_DIR` | Приватная директория платных планов, файлов и заказов; на Railway подключается к Volume | `data` |
 | `DISCOVERY_MAX_REPOS` | Максимум GitHub-репозиториев за один ручной поиск | `12` |
 | `DISCOVERY_MAX_FEEDS` | Максимум кандидатов за один ручной поиск | `16` |
 | `DISCOVERY_MAX_FILES_PER_REPO` | Максимум проверяемых файлов из одного репозитория | `3` |
@@ -167,7 +176,7 @@ python -m unittest discover -s tests -v
 python -m py_compile src/*.py tests/*.py
 ```
 
-Тесты покрывают plain/base64/escaped extraction входных данных, VLESS/Reality validation, private host rejection, normalized deduplication, GitHub-фильтры и лимиты discovery, динамических провайдеров, пагинацию конфигов, TCP latency, редактирование результата проверки, разницу в уведомлениях, файловый интерфейс, цветовые стили кнопок и очистку устаревших chunks.
+Тесты покрывают plain/base64/escaped extraction входных данных, VLESS/Reality validation, private host rejection, normalized deduplication, GitHub-фильтры и лимиты discovery, динамических провайдеров, платные планы и Stars, пагинацию конфигов, TCP latency, редактирование результата проверки, разницу в уведомлениях, нейтральные inline-кнопки и очистку устаревших chunks.
 
 ## 📂 Структура
 
@@ -179,12 +188,13 @@ vless-parser-bot/
 │   ├── config.py       # источники, зеркала и агрегаты
 │   ├── parser.py            # fetch/extract/validate/dedup/TCP
 │   ├── provider_registry.py # GitHub-only dynamic provider registry
+│   ├── paid_subscriptions.py # private paid-plan registry
 │   ├── subscription.py      # atomic `.txt`/chunk generation
 │   └── health.py            # Railway health-check only
 ├── providers.json           # persistent providers managed from the bot
 ├── tests/
 │   └── test_parser.py
-├── data/               # runtime-файлы
+├── data/               # runtime и приватные платные файлы (Railway Volume)
 ├── requirements.txt
 ├── Dockerfile
 └── docker-compose.yml

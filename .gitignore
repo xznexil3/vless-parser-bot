@@ -8,3 +8,4 @@ data/*.tmp
 !data/.gitkeep
 .idea/
 .vscode/
+data/paid_files/
